@@ -395,6 +395,24 @@ contain secrets, or provider tokens in Git or in incident notes.
 
 Applications are managed from `drewnet-apps` with Docker Compose. Do not add or start application containers as part of the control-plane configuration milestone.
 
+### HomeLabOps Product Prototype
+
+The AICorp application repository includes the read-only HomeLabOps prototype.
+It presents monitored service health, active Prometheus alerts, and the latest
+completed agent brief in one operator view. It does not execute commands,
+change infrastructure, restart services, access secrets, or bypass approvals.
+
+After deploying the platform, create a local SSH tunnel:
+
+```bash
+ssh -L 8081:127.0.0.1:8081 drew@control01.home.arpa
+```
+
+Open `http://127.0.0.1:8081/product` in the local browser. The page reads its
+status from the agent's read-only `/product-data` endpoint. Treat this as a
+prototype product workflow, not a public service; do not expose port 8081
+outside the reviewed operator access path.
+
 Before an application deployment:
 
 1. Validate the host configuration.

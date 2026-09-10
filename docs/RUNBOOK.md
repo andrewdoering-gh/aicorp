@@ -413,6 +413,13 @@ status from the agent's read-only `/product-data` endpoint. Treat this as a
 prototype product workflow, not a public service; do not expose port 8081
 outside the reviewed operator access path.
 
+The Product Manager workflow is separate from this operational view. Create an
+approved `generate_product_brief` request, use the authenticated PM workflow to
+generate and review one draft, then create a separate approved
+`approve_product_brief` request before publishing it. The PM agent produces
+product decisions and engineering backlog proposals; it has no shell,
+infrastructure, secret, or external-communication access.
+
 Before an application deployment:
 
 1. Validate the host configuration.

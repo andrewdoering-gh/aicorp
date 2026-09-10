@@ -407,6 +407,51 @@ Before an application deployment:
 
 Prefer tested backups over long-lived outer snapshots. Before increasing persistent workload data, verify that backup and restore procedures are documented and tested.
 
+### Durable AICorp Backup Destination
+
+Backups must be written to a mounted durable destination, not the control-plane
+root disk. The standard destination is:
+
+```text
+/mnt/backup/aicorp
+```
+
+Install the reviewed backup procedure from the Admin VM:
+
+```bash
+cd ~/git/drewnet/drewnet-config/ansible/aicorp
+ansible-playbook \
+  -i inventory/hosts.yml \
+  playbooks/backup.yml \
+  --limit aicorp-control01
+```
+
+Before running a backup, mount the approved backup storage at `/mnt/backup`.
+The script refuses to run when that mount is absent or has less than 5 GiB
+available.
+
+Run manually on `control01`:
+
+```bash
+sudo /usr/local/sbin/aicorp-backup
+```
+
+The procedure creates:
+
+```text
+/mnt/backup/aicorp/<timestamp>/aicorp-postgres.dump
+/mnt/backup/aicorp/<timestamp>/aicorp-files.tar.gz
+```
+
+Each artifact has a SHA-256 checksum. The backup includes PostgreSQL logical
+state, Redis, Qdrant, Open WebUI, Prometheus, Alertmanager, LiteLLM
+configuration, and the approved knowledge directory. It deliberately excludes
+`/opt/aicorp/.env`; credentials remain under the protected credential process.
+
+The script retains the seven newest backup sets. A backup is not considered
+validated until its checksums pass and the archive has been restored into a
+separate test directory or database.
+
 Recovery activities may include:
 
 - Restoring application data from a verified backup.

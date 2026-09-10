@@ -420,6 +420,13 @@ generate and review one draft, then create a separate approved
 product decisions and engineering backlog proposals; it has no shell,
 infrastructure, secret, or external-communication access.
 
+The CTO agent follows the approved PM artifact. It generates a technical plan
+only when the referenced product brief is already approved and the operator has
+approved `generate_technical_plan`. Review the draft through
+`GET /technical-plans/latest`, then use a separate `approve_technical_plan`
+approval before publishing it. The CTO plan recommends architecture and work;
+it does not authorize implementation or infrastructure changes.
+
 Before an application deployment:
 
 1. Validate the host configuration.

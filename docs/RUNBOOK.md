@@ -303,6 +303,94 @@ ansible \
 
 Check the Docker group and persistent directories through a reviewed, non-secret command when required. Do not print `/etc/docker/daemon.json` if local policy treats host configuration as sensitive.
 
+## Monitoring and Alert Delivery
+
+Prometheus and Alertmanager run on `aicorp-control01`. Prometheus evaluates the
+version-controlled rules and sends grouped firing and resolved alerts to
+Alertmanager. Alertmanager forwards those alerts to the receiver configured by
+the protected `ALERTMANAGER_WEBHOOK_URL` value in `/opt/aicorp/.env`.
+
+The webhook receiver owner is responsible for acknowledging delivery failures,
+maintaining the endpoint, and defining the human escalation path. The AICorp
+operator remains responsible for infrastructure, host, storage, and service
+alerts until a separate on-call owner is assigned.
+
+### Validate Monitoring Services
+
+```bash
+docker compose ps prometheus alertmanager alertmanager-config
+docker ps --filter name=aicorp-prometheus --filter name=aicorp-alertmanager
+```
+
+Validate the deployed Alertmanager configuration without printing it:
+
+```bash
+docker exec aicorp-alertmanager \
+  amtool check-config /etc/alertmanager/alertmanager.yml
+```
+
+Check Prometheus rule loading and Alertmanager connectivity from the local
+control-plane interfaces:
+
+```bash
+curl -fsS http://127.0.0.1:9090/-/ready
+curl -fsS http://127.0.0.1:9093/-/ready
+curl -fsS http://127.0.0.1:9090/api/v1/rules
+curl -fsS http://127.0.0.1:9090/api/v1/alertmanagers
+```
+
+The Prometheus UI is available through an SSH tunnel on local port `9090` and
+the Alertmanager UI through local port `9093`. Neither service is exposed
+directly on the workload network.
+
+### Test Notification Delivery
+
+Sending a synthetic alert is an external communication and requires human
+approval under ADR-014. Perform this test only after confirming that the
+configured receiver is a test destination or that the notification is expected.
+
+With approval, submit a short-lived synthetic alert to Alertmanager:
+
+```bash
+curl -fsS -X POST \
+  -H 'Content-Type: application/json' \
+  --data '[
+    {
+      "labels": {
+        "alertname": "AICorpNotificationTest",
+        "severity": "info",
+        "host": "aicorp-control01"
+      },
+      "annotations": {
+        "summary": "AICorp notification delivery test",
+        "description": "Synthetic test alert; no infrastructure action is required."
+      },
+      "startsAt": "2026-01-01T00:00:00Z",
+      "endsAt": "2026-01-01T00:05:00Z",
+      "generatorURL": "http://localhost:9090/graph"
+    }
+  ]' \
+  http://127.0.0.1:9093/api/v1/alerts
+```
+
+Verify the receiver records one firing notification and one resolved
+notification. Do not treat a successful HTTP response from Alertmanager as
+proof that the external receiver accepted the message; verify at the receiver.
+
+### Delivery and Escalation Expectations
+
+- Alertmanager groups alerts by `alertname` and `host`.
+- Initial grouping waits 30 seconds.
+- Subsequent grouped updates use a 5-minute interval.
+- Repeated unresolved alerts are resent every 4 hours.
+- Resolved alerts are sent because `send_resolved` is enabled.
+- The external receiver owns endpoint availability and downstream escalation.
+- A failed notification route must be recorded and manually escalated until a
+  replacement route is approved.
+
+Do not place webhook URLs, receiver credentials, notification payloads that
+contain secrets, or provider tokens in Git or in incident notes.
+
 ## Application Operations
 
 Applications are managed from `drewnet-apps` with Docker Compose. Do not add or start application containers as part of the control-plane configuration milestone.

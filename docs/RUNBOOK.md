@@ -427,6 +427,18 @@ approved `generate_technical_plan`. Review the draft through
 approval before publishing it. The CTO plan recommends architecture and work;
 it does not authorize implementation or infrastructure changes.
 
+The next governed handoff is the Engineering Manager plan. It requires an
+approved CTO plan and a `generate_engineering_plan` approval. After review and
+an `approve_engineering_plan` approval, generate separate worker plans for
+`software_engineer` and `qa_engineer`. Use the role-specific approval actions
+`generate_software_engineer_plan`, `approve_software_engineer_plan`,
+`generate_qa_plan`, and `approve_qa_plan`.
+
+All three workers are planning-only. They do not write repositories, run shell
+commands, deploy infrastructure, merge code, or mark work complete. Their
+outputs are handoff artifacts for the next explicitly approved implementation
+milestone.
+
 Before an application deployment:
 
 1. Validate the host configuration.

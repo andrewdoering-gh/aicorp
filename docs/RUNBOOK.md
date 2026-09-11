@@ -439,6 +439,25 @@ commands, deploy infrastructure, merge code, or mark work complete. Their
 outputs are handoff artifacts for the next explicitly approved implementation
 milestone.
 
+### First Governed Execution Slice
+
+The first execution workflow is evidence-first and does not give workers shell
+or repository access. Bind exactly one `work_item_id` to an approved
+Software Engineer worker plan with `start_software_engineer_execution`. After
+the worker submits its summary, changed surfaces, tests, results, and diff
+reference using `submit_software_engineer_execution`, use an approved QA worker
+plan to record pass/fail evidence with `record_qa_validation`.
+
+Inspect the resulting task through:
+
+```text
+GET /execution-tasks
+GET /execution-tasks/latest
+```
+
+The resulting `qa_passed` status does not authorize a commit, merge, or deploy.
+Those actions require separate, explicitly reviewed workflows.
+
 Before an application deployment:
 
 1. Validate the host configuration.

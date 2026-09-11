@@ -458,6 +458,20 @@ GET /execution-tasks/latest
 The resulting `qa_passed` status does not authorize a commit, merge, or deploy.
 Those actions require separate, explicitly reviewed workflows.
 
+### Repository Change Proposal
+
+For a QA-passed execution task, submit one bounded unified diff with the
+`submit_repository_change_proposal` approval. Inspect it through:
+
+```text
+GET /change-proposals/latest
+```
+
+An approved QA worker reviews the proposal with `review_repository_change`.
+Only a human may approve the proposal with `approve_repository_change`, and
+that approval still does not apply the patch. Commit, merge, and deployment
+remain separate workflows with their own review and approval boundaries.
+
 Before an application deployment:
 
 1. Validate the host configuration.

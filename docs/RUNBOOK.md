@@ -420,15 +420,31 @@ generate and review one draft, then create a separate approved
 product decisions and engineering backlog proposals; it has no shell,
 infrastructure, secret, or external-communication access.
 
+Artifact-generation approvals may be delegated to the upstream planning agent.
+Set these protected values in `/opt/aicorp/.env`:
+
+```text
+PRODUCT_MANAGER_APPROVAL_TOKEN       -> generate_technical_plan
+CTO_APPROVAL_TOKEN                   -> generate_engineering_plan
+ENGINEERING_MANAGER_APPROVAL_TOKEN   -> generate_software_engineer_plan, generate_qa_plan
+```
+
+The API derives the approver identity from the bearer token, rejects
+self-approval, and does not permit agent tokens to approve publication,
+repository changes, commits, merges, or deployments. The Product Manager
+brief remains human-approved because there is no upstream product-governance
+agent.
+
 The CTO agent follows the approved PM artifact. It generates a technical plan
-only when the referenced product brief is already approved and the operator has
-approved `generate_technical_plan`. Review the draft through
+only when the referenced product brief is already approved and the Product
+Manager agent has approved `generate_technical_plan`. Review the draft through
 `GET /technical-plans/latest`, then use a separate `approve_technical_plan`
 approval before publishing it. The CTO plan recommends architecture and work;
 it does not authorize implementation or infrastructure changes.
 
 The next governed handoff is the Engineering Manager plan. It requires an
-approved CTO plan and a `generate_engineering_plan` approval. After review and
+approved CTO plan and a `generate_engineering_plan` approval from the CTO
+agent. After review and
 an `approve_engineering_plan` approval, generate separate worker plans for
 `software_engineer` and `qa_engineer`. Use the role-specific approval actions
 `generate_software_engineer_plan`, `approve_software_engineer_plan`,
@@ -466,6 +482,13 @@ For a QA-passed execution task, submit one bounded unified diff with the
 ```text
 GET /change-proposals/latest
 ```
+
+The Software Engineer creates this approval request with the exact action
+`submit_repository_change_proposal`; it must not use a made-up action such as
+`generate_bounded_proposal`. After the request is approved, the Software
+Engineer submits the proposal with its task ID, approved worker-plan ID,
+approval ID, bounded file list, unified diff, and tests. Submission stores the
+proposal only and does not apply, commit, or deploy it.
 
 An approved QA worker reviews the proposal with `review_repository_change`.
 Only a human may approve the proposal with `approve_repository_change`, and

@@ -416,9 +416,11 @@ outside the reviewed operator access path.
 The Product Manager workflow is separate from this operational view. Create an
 approved `generate_product_brief` request, use the authenticated PM workflow to
 generate and review one draft, then create a separate approved
-`approve_product_brief` request before publishing it. The PM agent produces
-product decisions and engineering backlog proposals; it has no shell,
-infrastructure, secret, or external-communication access.
+`approve_product_brief` request before publishing it. This initial product
+brief approval is the first human gate. Intermediate artifact and execution
+handoffs are automatically approved and dispatched by the responsible-agent
+policy. Final deployment remains the second and last human gate. The PM agent
+has no shell, infrastructure, secret, or external-communication access.
 
 Artifact-generation approvals may be delegated to the upstream planning agent.
 Set these protected values in `/opt/aicorp/.env`:

@@ -433,7 +433,12 @@ The API derives the approver identity from the bearer token, rejects
 self-approval, and does not permit agent tokens to approve publication,
 repository changes, commits, merges, or deployments. The Product Manager
 brief remains human-approved because there is no upstream product-governance
-agent.
+agent. Once a generation approval is recorded, the API automatically dispatches
+the responsible agent's generation action. A dispatch failure is audited and
+must be retried by the operator; approval does not silently authorize a
+different action. Generation approval requests must include structured context
+such as `product_brief_id`, `technical_plan_id`, or `engineering_plan_id` so
+the dispatcher cannot select an unrelated latest artifact.
 
 The CTO agent follows the approved PM artifact. It generates a technical plan
 only when the referenced product brief is already approved and the Product

@@ -422,6 +422,11 @@ handoffs are automatically approved and dispatched by the responsible-agent
 policy. Final deployment remains the second and last human gate. The PM agent
 has no shell, infrastructure, secret, or external-communication access.
 
+If an approved repository proposal has mismatched evidence, supersede it rather
+than editing its audit history. Use the operator-only
+`POST /change-proposals/{id}/supersede` route with a reason, then submit a
+replacement execution record and proposal with matching file targets.
+
 Artifact-generation approvals may be delegated to the upstream planning agent.
 Set these protected values in `/opt/aicorp/.env`:
 

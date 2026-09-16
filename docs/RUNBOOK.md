@@ -4,13 +4,13 @@
 
 This runbook documents the procedures used to deploy, validate, operate, troubleshoot, back up, and recover the AICorp environment.
 
-AICorp spans four repositories:
+AICorp is one repository with three scoped child repositories:
 
 ```text
-aicorp          Project documentation and architecture
-drewnet-iac     Terraform infrastructure definitions
-drewnet-config  Ansible operating-system and platform configuration
-drewnet-apps    Application services, agents, and product code
+aicorp-iac      Terraform infrastructure definitions
+aicorp-config   Ansible operating-system and platform configuration
+aicorp-apps     Application services, agents, and product code
+docs            Project documentation and architecture
 ```
 
 ## Operational Principles
@@ -81,10 +81,10 @@ The control-plane host uses `control01.home.arpa`, which must resolve to `192.16
 The repositories are checked out under:
 
 ```text
-~/git/drewnet/aicorp/
-~/git/drewnet/drewnet-iac/
-~/git/drewnet/drewnet-config/
-~/git/drewnet/drewnet-apps/
+~/git/AICorp/
+~/git/AICorp/aicorp-iac/
+~/git/AICorp/aicorp-config/
+~/git/AICorp/aicorp-apps/
 ```
 
 The designated Admin VM is the deployment execution host. Credentials are loaded from protected external locations and must never be printed or committed.
@@ -114,7 +114,7 @@ The outer Terraform root manages resources on the physical Proxmox node, includi
 Location:
 
 ```text
-~/git/drewnet/drewnet-iac/terraform/proxmox
+~/git/DrewNet/drewnet-iac/terraform/proxmox
 ```
 
 The outer and inner Terraform roots use separate state objects. Load the required protected credentials using the local operator procedure without displaying their values.
@@ -122,7 +122,7 @@ The outer and inner Terraform roots use separate state objects. Load the require
 Validate and plan:
 
 ```bash
-cd ~/git/drewnet/drewnet-iac/terraform/proxmox
+cd ~/git/DrewNet/drewnet-iac/terraform/proxmox
 terraform init
 terraform fmt -recursive
 terraform validate
@@ -144,7 +144,7 @@ The inner Terraform root manages resources inside `aicorp-pve01`.
 Location:
 
 ```text
-~/git/drewnet/drewnet-iac/terraform/aicorp
+~/git/AICorp/aicorp-iac/terraform/aicorp
 ```
 
 Use the approved local wrapper or equivalent operator procedure so the correct protected credentials are loaded without exposing them.
@@ -152,7 +152,7 @@ Use the approved local wrapper or equivalent operator procedure so the correct p
 Validate and plan:
 
 ```bash
-cd ~/git/drewnet/drewnet-iac/terraform/aicorp
+cd ~/git/AICorp/aicorp-iac/terraform/aicorp
 terraform init
 terraform fmt -recursive
 terraform validate
@@ -180,7 +180,7 @@ Do not modify Terraform resources or state as part of routine Ansible configurat
 Ansible manages the operating-system and host platform configuration. The AICorp Ansible root is:
 
 ```text
-~/git/drewnet/drewnet-config/ansible/aicorp
+~/git/AICorp/aicorp-config/ansible/aicorp
 ```
 
 The AICorp inventory targets only `aicorp-control01`:
@@ -194,7 +194,7 @@ The AICorp configuration reuses the shared homelab `ubuntu_baseline` role throug
 ### Install Ansible Collection Dependencies
 
 ```bash
-cd ~/git/drewnet/drewnet-config/ansible/aicorp
+cd ~/git/AICorp/aicorp-config/ansible/aicorp
 ansible-galaxy collection install -r requirements.yml
 ```
 
@@ -393,7 +393,7 @@ contain secrets, or provider tokens in Git or in incident notes.
 
 ## Application Operations
 
-Applications are managed from `drewnet-apps` with Docker Compose. Do not add or start application containers as part of the control-plane configuration milestone.
+Applications are managed from `aicorp-apps` with Docker Compose. Do not add or start application containers as part of the control-plane configuration milestone.
 
 ### HomeLabOps Product Prototype
 
@@ -554,7 +554,7 @@ root disk. The standard destination is:
 Install the reviewed backup procedure from the Admin VM:
 
 ```bash
-cd ~/git/drewnet/drewnet-config/ansible/aicorp
+cd ~/git/AICorp/aicorp-config/ansible/aicorp
 ansible-playbook \
   -i inventory/hosts.yml \
   playbooks/backup.yml \

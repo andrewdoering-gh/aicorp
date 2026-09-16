@@ -40,15 +40,15 @@ The long-term objective is to operate a small virtual company in which AI agents
 
 ## Repository Architecture
 
-AICorp spans several Drewnet repositories.
+AICorp is maintained as one repository with three scoped child repositories.
 
 ```text
 AICorp
-├── drewnet-iac
+├── aicorp-iac
 │   └── Infrastructure lifecycle and virtual resources
-├── drewnet-config
+├── aicorp-config
 │   └── Operating-system and platform configuration
-├── drewnet-apps
+├── aicorp-apps
 │   └── Application services, agents, and product code
-└── aicorp
+└── docs
     └── Project-level documentation and coordination

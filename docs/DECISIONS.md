@@ -4,7 +4,7 @@
 
 This document records significant architectural, operational, security, and governance decisions for AICorp.
 
-AICorp spans several repositories and infrastructure layers. These decisions provide a shared architectural baseline for `aicorp`, `drewnet-iac`, `drewnet-config`, and `drewnet-apps`.
+AICorp is organized as one project repository with the `aicorp-iac`, `aicorp-config`, and `aicorp-apps` child repositories. These decisions provide the shared architectural baseline for all four layers.
 
 ## Decision Statuses
 

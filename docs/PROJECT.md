@@ -244,14 +244,14 @@ Agent decisions, tool calls, approvals, failures, and significant state transiti
 
 ## Repository Architecture
 
-AICorp spans four repositories.
+AICorp is one repository with three scoped child repositories.
 
 AICorp
-├── aicorp
-│   └── Umbrella documentation and project coordination
-├── drewnet-iac
+├── aicorp-iac
 │   └── Infrastructure lifecycle
-├── drewnet-config
+├── aicorp-config
 │   └── Operating-system and platform configuration
-└── drewnet-apps
+├── aicorp-apps
     └── Applications, agents, and products
+└── docs
+    └── Project documentation and coordination

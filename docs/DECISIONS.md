@@ -179,7 +179,7 @@ Secrets, credentials, private keys, tokens, passwords, and environment-specific 
 
 **Status:** Accepted
 
-Infrastructure lifecycle belongs in `drewnet-iac`, operating-system and platform configuration belongs in `drewnet-config`, application and product code belongs in `drewnet-apps`, and project documentation belongs in `aicorp`.
+Infrastructure lifecycle belongs in `aicorp-iac`, operating-system and platform configuration belongs in `aicorp-config`, application and product code belongs in `aicorp-apps`, and project documentation belongs in `AICorp`.
 
 ---
 

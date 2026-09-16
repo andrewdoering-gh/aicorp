@@ -611,7 +611,7 @@ Never disable state locking for routine operations. If a lock error occurs:
 For Ansible configuration changes:
 
 ```bash
-cd ~/git/drewnet/drewnet-config
+cd ~/git/AICorp/aicorp-config
 
 git status
 git diff -- ansible/aicorp

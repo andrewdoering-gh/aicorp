@@ -2,19 +2,19 @@
   "folders": [
     {
       "name": "AICorp Project",
-      "path": "aicorp"
+      "path": "."
     },
     {
       "name": "Infrastructure",
-      "path": "drewnet-iac"
+      "path": "aicorp-iac"
     },
     {
       "name": "Configuration",
-      "path": "drewnet-config"
+      "path": "aicorp-config"
     },
     {
       "name": "Applications",
-      "path": "drewnet-apps"
+      "path": "aicorp-apps"
     },
     {
       "path": "docs"

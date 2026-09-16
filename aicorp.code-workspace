@@ -1,0 +1,28 @@
+{
+  "folders": [
+    {
+      "name": "AICorp Project",
+      "path": "aicorp"
+    },
+    {
+      "name": "Infrastructure",
+      "path": "drewnet-iac"
+    },
+    {
+      "name": "Configuration",
+      "path": "drewnet-config"
+    },
+    {
+      "name": "Applications",
+      "path": "drewnet-apps"
+    },
+    {
+      "path": "docs"
+    }
+  ],
+  "settings": {
+    "files.exclude": {
+      "**/.terraform": true
+    }
+  }
+}

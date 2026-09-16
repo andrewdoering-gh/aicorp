@@ -413,14 +413,14 @@ status from the agent's read-only `/product-data` endpoint. Treat this as a
 prototype product workflow, not a public service; do not expose port 8081
 outside the reviewed operator access path.
 
-The Product Manager workflow is separate from this operational view. Create an
-approved `generate_product_brief` request, use the authenticated PM workflow to
-generate and review one draft, then create a separate approved
-`approve_product_brief` request before publishing it. This initial product
-brief approval is the first human gate. Intermediate artifact and execution
-handoffs are automatically approved and dispatched by the responsible-agent
-policy. Final deployment remains the second and last human gate. The PM agent
-has no shell, infrastructure, secret, or external-communication access.
+The Product Manager workflow is separate from this operational view. Request a
+new brief through the PM request workflow; the server automatically queues
+`generate_product_brief`. The PM generates a draft and the server creates the
+pending `approve_product_brief` request automatically. Approval of that request
+publishes the exact draft and automatically starts the downstream CTO,
+Engineering Manager, and worker-plan handoffs. Final deployment remains the
+second and last human gate. The PM agent has no shell, infrastructure, secret,
+or external-communication access.
 
 If an approved repository proposal has mismatched evidence, supersede it rather
 than editing its audit history. Use the operator-only
@@ -439,9 +439,9 @@ ENGINEERING_MANAGER_APPROVAL_TOKEN   -> generate_software_engineer_plan, generat
 The API derives the approver identity from the bearer token, rejects
 self-approval, and does not permit agent tokens to approve publication,
 repository changes, commits, merges, or deployments. The Product Manager
-brief remains human-approved because there is no upstream product-governance
-agent. Once a generation approval is recorded, the API automatically dispatches
-the responsible agent's generation action. A dispatch failure is audited and
+brief remains human-approved for publication. Once the automatic generation
+handoff is recorded, the API dispatches the responsible agent's generation
+action. A dispatch failure is audited and
 must be retried by the operator; approval does not silently authorize a
 different action. Generation approval requests must include structured context
 such as `product_brief_id`, `technical_plan_id`, or `engineering_plan_id` so
@@ -454,6 +454,15 @@ Manager agent has approved `generate_technical_plan`. Review the draft through
 approval before publishing it. The CTO plan recommends architecture and work;
 it does not authorize implementation or infrastructure changes.
 
+When a newly identified dependency makes the approved plan incomplete, request
+an amendment through `POST /technical-plans/amend` with the approved parent
+plan ID and a non-empty list of explicit dependencies. The API creates one
+pending `generate_technical_plan` request for that amendment. After the
+generation approval, the CTO creates a new draft linked to the parent plan and
+the API creates a fresh pending `approve_technical_plan` request. The amended
+plan cannot advance to the Engineering Manager until that second technical-plan
+approval is recorded; the original approved plan remains unchanged.
+
 The next governed handoff is the Engineering Manager plan. It requires an
 approved CTO plan and a `generate_engineering_plan` approval from the CTO
 agent. After review and
@@ -461,6 +470,18 @@ an `approve_engineering_plan` approval, generate separate worker plans for
 `software_engineer` and `qa_engineer`. Use the role-specific approval actions
 `generate_software_engineer_plan`, `approve_software_engineer_plan`,
 `generate_qa_plan`, and `approve_qa_plan`.
+
+Engineering Manager milestones are structured records rather than free-form
+completion claims. Each milestone includes an ID, description, status, and
+dependencies. New milestones are `planned`; `complete` is valid only when
+approved execution and QA evidence supports it.
+
+Automatic handoffs retry transient failures a bounded number of times. Inspect
+`approved_action_dispatch_failed` and
+`approved_action_dispatch_exhausted` audit events for the attempt number,
+HTTP status, and redacted response detail. After correcting a deterministic
+validation or fixture issue, the operator can retry the approved generation
+request with `POST /approval-requests/{id}/retry`.
 
 All three workers are planning-only. They do not write repositories, run shell
 commands, deploy infrastructure, merge code, or mark work complete. Their
@@ -503,9 +524,11 @@ approval ID, bounded file list, unified diff, and tests. Submission stores the
 proposal only and does not apply, commit, or deploy it.
 
 An approved QA worker reviews the proposal with `review_repository_change`.
-Only a human may approve the proposal with `approve_repository_change`, and
-that approval still does not apply the patch. Commit, merge, and deployment
-remain separate workflows with their own review and approval boundaries.
+When that review passes, the server automatically records the proposal as
+approved and writes the `repository_change_approved` audit event. No separate
+repository-change approval request is created. The system then creates the
+single human-only `deploy` approval. Product publication and deployment are
+the only human gates in the product-to-deployment workflow.
 
 Before an application deployment:
 

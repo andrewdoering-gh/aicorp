@@ -4,7 +4,7 @@
 
 This runbook documents the procedures used to deploy, validate, operate, troubleshoot, back up, and recover the AICorp environment.
 
-AICorp is one repository with three scoped child repositories:
+AICorp is one repository with three scoped project folders:
 
 ```text
 aicorp-iac      Terraform infrastructure definitions

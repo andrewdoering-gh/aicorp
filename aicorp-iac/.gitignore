@@ -1,0 +1,37 @@
+# Terraform provider and module cache
+**/.terraform/*
+
+# Terraform state
+*.tfstate
+*.tfstate.*
+
+# Saved plans
+*.tfplan
+tfplan
+
+# Local variable and secret files
+*.tfvars
+*.tfvars.json
+
+# Terraform diagnostic files
+crash.log
+crash.*.log
+
+# Local environment files
+.env
+.env.*
+.envrc
+.direnv/
+
+# Override files
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+*.auto.pkrvars.hcl
+*.pkrvars.hcl
+!*.pkrvars.hcl.example
+packer_cache/
+.packer.d/
+*.iso
+terraform-minio.env

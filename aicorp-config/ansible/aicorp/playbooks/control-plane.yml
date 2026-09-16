@@ -1,0 +1,32 @@
+---
+- name: Configure AI company control-plane host
+  hosts: aicorp-control01
+  become: true
+
+  tasks:
+    - name: Set hostname
+      ansible.builtin.hostname:
+        name: "{{ target_hostname }}"
+      tags: hostname
+
+    - name: Ensure hostname resolves in /etc/hosts
+      ansible.builtin.lineinfile:
+        path: /etc/hosts
+        regexp: '^127\.0\.1\.1\s'
+        line: "127.0.1.1 {{ target_hostname }}"
+        state: present
+      tags: hostname
+
+    - name: Create persistent aicorp directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: drew
+        group: drew
+        mode: "0755"
+      loop: "{{ aicorp_directories }}"
+      tags: directories
+
+  roles:
+    - ubuntu_baseline
+    - docker

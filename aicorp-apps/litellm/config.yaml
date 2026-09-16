@@ -1,0 +1,28 @@
+model_list:
+  - model_name: gpt-5.6-luna
+    litellm_params:
+      model: openai/gpt-5.6-luna
+      api_key: os.environ/OPENAI_API_KEY
+
+  - model_name: gpt-4o-mini
+    litellm_params:
+      model: openai/gpt-4o-mini
+      api_key: os.environ/OPENAI_API_KEY
+
+  - model_name: local-qwen3.5-9b
+    litellm_params:
+      model: ollama/qwen3.5:9b
+      api_base: os.environ/OLLAMA_BASE_URL
+      extra_body:
+        think: false
+
+litellm_settings:
+  drop_params: true
+  json_logs: true
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
+
+router_settings:
+  fallbacks:
+    - gpt-4o-mini: [local-qwen3.5-9b]

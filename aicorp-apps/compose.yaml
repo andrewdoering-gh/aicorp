@@ -1,0 +1,276 @@
+name: aicorp
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: aicorp-postgres
+    restart: unless-stopped
+
+    environment:
+      POSTGRES_DB: "${POSTGRES_DB:-aicorp}"
+      POSTGRES_USER: "${POSTGRES_USER:-aicorp}"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in the external environment}"
+
+    volumes:
+      - /opt/aicorp/data/postgres:/var/lib/postgresql/data
+
+    ports:
+      - "127.0.0.1:5432:5432"
+
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+    networks:
+      aicorp:
+        aliases:
+          - aicorp
+
+    logging: &bounded-logging
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  redis:
+    image: redis:7-alpine
+    container_name: aicorp-redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+
+    volumes:
+      - /opt/aicorp/data/redis:/data
+
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+    networks:
+      - aicorp
+
+    logging: *bounded-logging
+
+  qdrant:
+    image: qdrant/qdrant:v1.14.1
+    container_name: aicorp-qdrant
+    restart: unless-stopped
+
+    volumes:
+      - /opt/aicorp/data/qdrant:/qdrant/storage
+
+    healthcheck:
+      test: ["CMD-SHELL", "timeout 3 bash -c '</dev/tcp/127.0.0.1/6333'"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+    networks:
+      - aicorp
+
+    logging: *bounded-logging
+
+  litellm:
+    image: ghcr.io/berriai/litellm:v1.74.3-stable
+    container_name: aicorp-litellm
+    restart: unless-stopped
+    command: ["--config", "/app/config.yaml", "--port", "4000"]
+
+    environment:
+      LITELLM_MASTER_KEY: "${LITELLM_MASTER_KEY:?LITELLM_MASTER_KEY must be set in the external environment}"
+      OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
+      OLLAMA_BASE_URL: "${OLLAMA_BASE_URL:?OLLAMA_BASE_URL must be set in the external environment}"
+      DATABASE_URL: "${DATABASE_URL:?DATABASE_URL must be set in the external environment}"
+
+    ports:
+      - "127.0.0.1:4000:4000"
+
+    volumes:
+      - /opt/aicorp/config/litellm/config.yaml:/app/config.yaml:ro
+      - /opt/aicorp/logs/litellm:/var/log/litellm
+
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--output-document=/dev/null", "http://localhost:4000/health/liveliness"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+    networks:
+      - aicorp
+
+    logging: *bounded-logging
+
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:v0.6.31
+    container_name: aicorp-open-webui
+    restart: unless-stopped
+
+    environment:
+      OPENAI_API_BASE_URL: http://litellm:4000/v1
+      OPENAI_API_KEYS: "${LITELLM_MASTER_KEY:?LITELLM_MASTER_KEY must be set in the external environment}"
+      WEBUI_AUTH_TRUSTED_EMAIL_HEADER: ""
+
+    ports:
+      - "127.0.0.1:3000:8080"
+
+    volumes:
+      - /opt/aicorp/data/open-webui:/app/backend/data
+
+    depends_on:
+      litellm:
+        condition: service_healthy
+
+    networks:
+      - aicorp
+
+    logging: *bounded-logging
+
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    container_name: aicorp-prometheus
+    restart: unless-stopped
+
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--web.enable-lifecycle"
+
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+    ports:
+      - "127.0.0.1:9090:9090"
+
+    volumes:
+      - /opt/aicorp/config/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - /opt/aicorp/config/prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - /opt/aicorp/data/prometheus:/prometheus
+
+    networks:
+      - aicorp
+
+    logging: *bounded-logging
+
+  alertmanager:
+    image: quay.io/prometheus/alertmanager:v0.27.0
+    container_name: aicorp-alertmanager
+    restart: unless-stopped
+
+    command:
+      - "--config.file=/etc/alertmanager/alertmanager.yml"
+      - "--storage.path=/alertmanager"
+
+    depends_on:
+      alertmanager-config:
+        condition: service_completed_successfully
+
+    ports:
+      - "127.0.0.1:9093:9093"
+
+    volumes:
+      - /opt/aicorp/config/alertmanager/rendered:/etc/alertmanager:ro
+      - /opt/aicorp/data/alertmanager:/alertmanager
+
+    networks:
+      - aicorp
+
+    logging: *bounded-logging
+
+  alertmanager-config:
+    image: alpine:3.20
+    container_name: aicorp-alertmanager-config
+    restart: "no"
+
+    environment:
+      ALERTMANAGER_WEBHOOK_URL: "${ALERTMANAGER_WEBHOOK_URL:?ALERTMANAGER_WEBHOOK_URL must be set in the external environment}"
+
+    command:
+      - /bin/sh
+      - -ec
+      - >-
+        awk -v replacement="$${ALERTMANAGER_WEBHOOK_URL}"
+        'BEGIN { token="__ALERTMANAGER_WEBHOOK_URL__" }
+        { position=index($0, token); if (position) print substr($0, 1, position-1) replacement substr($0, position+length(token)); else print }'
+        /template/alertmanager.yml.tmpl > /rendered/alertmanager.yml
+
+    volumes:
+      - /opt/aicorp/config/alertmanager/alertmanager.yml.tmpl:/template/alertmanager.yml.tmpl:ro
+      - /opt/aicorp/config/alertmanager/rendered:/rendered
+
+    networks:
+      - aicorp
+
+    logging: *bounded-logging
+
+  agent:
+    build:
+      context: /opt/aicorp/agent
+    image: aicorp-health-agent:0.2.0
+    container_name: aicorp-agent
+    restart: unless-stopped
+
+    environment:
+      AGENT_NAME: "${AGENT_NAME:-aicorp-health-summary}"
+      AGENT_MODEL: "${AGENT_MODEL:-gpt-5.6-luna}"
+      PRODUCT_MANAGER_NAME: "${PRODUCT_MANAGER_NAME:-aicorp-product-manager}"
+      PRODUCT_MANAGER_MODEL: "${PRODUCT_MANAGER_MODEL:-gpt-5.6-luna}"
+      CTO_NAME: "${CTO_NAME:-aicorp-cto}"
+      CTO_MODEL: "${CTO_MODEL:-gpt-5.6-luna}"
+      ENGINEERING_MANAGER_NAME: "${ENGINEERING_MANAGER_NAME:-aicorp-engineering-manager}"
+      ENGINEERING_MANAGER_MODEL: "${ENGINEERING_MANAGER_MODEL:-gpt-5.6-luna}"
+      SOFTWARE_ENGINEER_NAME: "${SOFTWARE_ENGINEER_NAME:-aicorp-software-engineer}"
+      QA_ENGINEER_NAME: "${QA_ENGINEER_NAME:-aicorp-qa-engineer}"
+      WORKER_MODEL: "${WORKER_MODEL:-gpt-5.6-luna}"
+      AGENT_INTERVAL_SECONDS: "${AGENT_INTERVAL_SECONDS:-3600}"
+      AGENT_HTTP_PORT: "8081"
+      AGENT_APPROVAL_TOKEN: "${AGENT_APPROVAL_TOKEN:-}"
+      AICORP_OPERATOR_NAME: "${AICORP_OPERATOR_NAME:-andrew}"
+      PRODUCT_MANAGER_APPROVAL_TOKEN: "${PRODUCT_MANAGER_APPROVAL_TOKEN:-}"
+      CTO_APPROVAL_TOKEN: "${CTO_APPROVAL_TOKEN:-}"
+      ENGINEERING_MANAGER_APPROVAL_TOKEN: "${ENGINEERING_MANAGER_APPROVAL_TOKEN:-}"
+      SOFTWARE_ENGINEER_APPROVAL_TOKEN: "${SOFTWARE_ENGINEER_APPROVAL_TOKEN:-}"
+      QA_ENGINEER_APPROVAL_TOKEN: "${QA_ENGINEER_APPROVAL_TOKEN:-}"
+      DATABASE_URL: "${DATABASE_URL:?DATABASE_URL must be set in the external environment}"
+      LITELLM_BASE_URL: "http://litellm:4000"
+      LITELLM_MASTER_KEY: "${LITELLM_MASTER_KEY:?LITELLM_MASTER_KEY must be set in the external environment}"
+      OLLAMA_BASE_URL: "${OLLAMA_BASE_URL:?OLLAMA_BASE_URL must be set in the external environment}"
+      EMBEDDING_MODEL: "${EMBEDDING_MODEL:-nomic-embed-text}"
+      KNOWLEDGE_COLLECTION: "${KNOWLEDGE_COLLECTION:-aicorp-knowledge}"
+      PROMETHEUS_URL: "http://prometheus:9090"
+      QDRANT_URL: "http://qdrant:6333"
+
+    depends_on:
+      postgres:
+        condition: service_healthy
+      litellm:
+        condition: service_healthy
+      prometheus:
+        condition: service_started
+      qdrant:
+        condition: service_healthy
+
+    ports:
+      - "127.0.0.1:8081:8081"
+
+    volumes:
+      - /opt/aicorp/knowledge:/app/knowledge:ro
+      - /opt/aicorp:/workspace/repository:ro
+
+    networks:
+      - aicorp
+
+    logging: *bounded-logging
+
+networks:
+  aicorp:
+    name: aicorp
+    driver: bridge

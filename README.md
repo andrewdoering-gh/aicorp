@@ -40,7 +40,7 @@ The long-term objective is to operate a small virtual company in which AI agents
 
 ## Repository Architecture
 
-AICorp is maintained as one repository with three scoped child repositories.
+AICorp is maintained as one repository with three scoped project folders.
 
 ```text
 AICorp

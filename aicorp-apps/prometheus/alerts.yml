@@ -1,0 +1,89 @@
+groups:
+  - name: aicorp-host
+    rules:
+      - alert: AICorpNodeExporterDown
+        expr: up{job="aicorp-control01"} == 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "AICorp Node Exporter is down"
+          description: "Prometheus cannot scrape Node Exporter on aicorp-control01."
+
+      - alert: AICorpRootFilesystemLow
+        expr: |
+          (
+            node_filesystem_avail_bytes{job="aicorp-control01",mountpoint="/",fstype!~"tmpfs|overlay"}
+            /
+            node_filesystem_size_bytes{job="aicorp-control01",mountpoint="/",fstype!~"tmpfs|overlay"}
+          ) < 0.15
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "AICorp root filesystem is low"
+          description: "The root filesystem on aicorp-control01 has less than 15% free space."
+
+      - alert: AICorpRootFilesystemCritical
+        expr: |
+          (
+            node_filesystem_avail_bytes{job="aicorp-control01",mountpoint="/",fstype!~"tmpfs|overlay"}
+            /
+            node_filesystem_size_bytes{job="aicorp-control01",mountpoint="/",fstype!~"tmpfs|overlay"}
+          ) < 0.05
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "AICorp root filesystem is critically low"
+          description: "The root filesystem on aicorp-control01 has less than 5% free space."
+
+      - alert: AICorpMemoryLow
+        expr: |
+          (
+            node_memory_MemAvailable_bytes{job="aicorp-control01"}
+            /
+            node_memory_MemTotal_bytes{job="aicorp-control01"}
+          ) < 0.10
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "AICorp available memory is low"
+          description: "aicorp-control01 has less than 10% memory available."
+
+      - alert: AICorpFilesystemReadOnly
+        expr: node_filesystem_readonly{job="aicorp-control01",mountpoint="/"} == 1
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "AICorp root filesystem is read-only"
+          description: "The root filesystem on aicorp-control01 is mounted read-only."
+
+      - alert: AICorpAgentDown
+        expr: up{job="aicorp-agent"} == 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "AICorp agent endpoint is down"
+          description: "Prometheus cannot scrape the persistent agent metrics endpoint."
+
+      - alert: AICorpAgentRunFailed
+        expr: aicorp_agent_last_run_success{job="aicorp-agent"} == 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "AICorp agent latest run failed"
+          description: "The latest persistent agent health-summary run did not complete successfully."
+
+      - alert: AICorpApprovalBacklog
+        expr: aicorp_agent_pending_approval_requests{job="aicorp-agent"} > 0
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "AICorp approval requests are pending"
+          description: "One or more AICorp approval requests have awaited human review for 30 minutes."

@@ -1,0 +1,299 @@
+---
+- name: Deploy AICorp platform services
+  hosts: aicorp-control01
+  become: true
+
+  vars:
+    aicorp_apps_source_dir: "{{ playbook_dir }}/../../../../aicorp-apps"
+    aicorp_compose_file: "{{ aicorp_base_dir }}/compose.yaml"
+    aicorp_litellm_config_file: "{{ aicorp_base_dir }}/config/litellm/config.yaml"
+    aicorp_prometheus_config_file: "{{ aicorp_base_dir }}/config/prometheus/prometheus.yml"
+    aicorp_prometheus_alerts_file: "{{ aicorp_base_dir }}/config/prometheus/alerts.yml"
+    aicorp_alertmanager_template_file: "{{ aicorp_base_dir }}/config/alertmanager/alertmanager.yml.tmpl"
+    aicorp_agent_dir: "{{ aicorp_base_dir }}/agent"
+    aicorp_knowledge_dir: "{{ aicorp_base_dir }}/knowledge"
+    aicorp_umbrella_source_dir: "{{ playbook_dir }}/../../../.."
+    aicorp_external_env_file: "{{ aicorp_base_dir }}/.env"
+    aicorp_deployment_worker_file: "{{ aicorp_base_dir }}/deployment-worker.py"
+    aicorp_deployment_worker_unit: "/etc/systemd/system/aicorp-deployment-worker.service"
+
+  tasks:
+    - name: Verify the platform source files exist on the Admin VM
+      ansible.builtin.stat:
+        path: "{{ item }}"
+      delegate_to: localhost
+      become: false
+      loop:
+        - "{{ aicorp_apps_source_dir }}/compose.yaml"
+        - "{{ aicorp_apps_source_dir }}/litellm/config.yaml"
+        - "{{ aicorp_apps_source_dir }}/prometheus/prometheus.yml"
+        - "{{ aicorp_apps_source_dir }}/prometheus/alerts.yml"
+        - "{{ aicorp_apps_source_dir }}/alertmanager/alertmanager.yml.tmpl"
+        - "{{ aicorp_apps_source_dir }}/agent/Dockerfile"
+        - "{{ aicorp_apps_source_dir }}/agent/requirements.txt"
+        - "{{ aicorp_apps_source_dir }}/agent/agent.py"
+        - "{{ aicorp_apps_source_dir }}/agent/knowledge.py"
+        - "{{ aicorp_apps_source_dir }}/agent/governance.py"
+        - "{{ aicorp_apps_source_dir }}/agent/homelabops.html"
+        - "{{ aicorp_apps_source_dir }}/agent/product_manager.py"
+        - "{{ aicorp_apps_source_dir }}/agent/cto.py"
+        - "{{ aicorp_apps_source_dir }}/agent/workers.py"
+        - "{{ aicorp_apps_source_dir }}/agent/execution.py"
+        - "{{ aicorp_apps_source_dir }}/deployment-worker.py"
+        - "{{ aicorp_umbrella_source_dir }}/README.md"
+        - "{{ aicorp_umbrella_source_dir }}/docs/PROJECT.md"
+        - "{{ aicorp_umbrella_source_dir }}/docs/DECISIONS.md"
+        - "{{ aicorp_umbrella_source_dir }}/docs/RUNBOOK.md"
+      register: aicorp_platform_source_files
+
+    - name: Require the platform source files on the Admin VM
+      ansible.builtin.assert:
+        that:
+          - item.stat.exists
+          - item.stat.isreg
+        fail_msg: "Required platform source file is missing: {{ item.item }}"
+      loop: "{{ aicorp_platform_source_files.results }}"
+
+    - name: Verify external platform environment exists on control01
+      ansible.builtin.stat:
+        path: "{{ aicorp_external_env_file }}"
+      register: aicorp_external_env
+
+    - name: Require external platform environment on control01
+      ansible.builtin.assert:
+        that:
+          - aicorp_external_env.stat.exists
+          - aicorp_external_env.stat.isreg
+          - aicorp_external_env.stat.mode == '0600'
+        fail_msg: >-
+          {{ aicorp_external_env_file }} must exist on control01 with mode 0600.
+          Create it through the protected operator procedure; do not commit or copy it.
+
+    - name: Ensure platform configuration directories exist
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+      loop:
+        - "{{ aicorp_base_dir }}"
+        - "{{ aicorp_base_dir }}/config"
+        - "{{ aicorp_base_dir }}/config/litellm"
+        - "{{ aicorp_base_dir }}/config/prometheus"
+        - "{{ aicorp_base_dir }}/config/alertmanager"
+        - "{{ aicorp_base_dir }}/config/alertmanager/rendered"
+        - "{{ aicorp_base_dir }}/logs"
+        - "{{ aicorp_base_dir }}/logs/litellm"
+        - "{{ aicorp_base_dir }}/data/prometheus"
+        - "{{ aicorp_base_dir }}/data/alertmanager"
+        - "{{ aicorp_agent_dir }}"
+        - "{{ aicorp_knowledge_dir }}/docs"
+
+    - name: Ensure Prometheus can write its TSDB
+      ansible.builtin.file:
+        path: "{{ aicorp_base_dir }}/data/prometheus"
+        state: directory
+        owner: "65534"
+        group: "65534"
+        mode: "0750"
+
+    - name: Ensure Alertmanager can write its state
+      ansible.builtin.file:
+        path: "{{ aicorp_base_dir }}/data/alertmanager"
+        state: directory
+        owner: "65534"
+        group: "65534"
+        mode: "0750"
+
+    - name: Copy the AICorp Compose file to control01
+      ansible.builtin.copy:
+        src: "{{ aicorp_apps_source_dir }}/compose.yaml"
+        dest: "{{ aicorp_compose_file }}"
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Copy the LiteLLM configuration to control01
+      ansible.builtin.copy:
+        src: "{{ aicorp_apps_source_dir }}/litellm/config.yaml"
+        dest: "{{ aicorp_litellm_config_file }}"
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Copy the Prometheus configuration to control01
+      ansible.builtin.copy:
+        src: "{{ aicorp_apps_source_dir }}/prometheus/prometheus.yml"
+        dest: "{{ aicorp_prometheus_config_file }}"
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Copy the Prometheus alert rules to control01
+      ansible.builtin.copy:
+        src: "{{ aicorp_apps_source_dir }}/prometheus/alerts.yml"
+        dest: "{{ aicorp_prometheus_alerts_file }}"
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Copy the Alertmanager configuration template to control01
+      ansible.builtin.copy:
+        src: "{{ aicorp_apps_source_dir }}/alertmanager/alertmanager.yml.tmpl"
+        dest: "{{ aicorp_alertmanager_template_file }}"
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Copy the AICorp agent Dockerfile to control01
+      ansible.builtin.copy:
+        src: "{{ aicorp_apps_source_dir }}/agent/Dockerfile"
+        dest: "{{ aicorp_agent_dir }}/Dockerfile"
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Copy the AICorp agent requirements to control01
+      ansible.builtin.copy:
+        src: "{{ aicorp_apps_source_dir }}/agent/requirements.txt"
+        dest: "{{ aicorp_agent_dir }}/requirements.txt"
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Copy the AICorp agent source to control01
+      ansible.builtin.copy:
+        src: "{{ aicorp_apps_source_dir }}/agent/agent.py"
+        dest: "{{ aicorp_agent_dir }}/agent.py"
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Copy the AICorp knowledge ingestion source to control01
+      ansible.builtin.copy:
+        src: "{{ aicorp_apps_source_dir }}/agent/knowledge.py"
+        dest: "{{ aicorp_agent_dir }}/knowledge.py"
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Copy the AICorp governance source to control01
+      ansible.builtin.copy:
+        src: "{{ aicorp_apps_source_dir }}/agent/governance.py"
+        dest: "{{ aicorp_agent_dir }}/governance.py"
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Copy the HomeLabOps product prototype to control01
+      ansible.builtin.copy:
+        src: "{{ aicorp_apps_source_dir }}/agent/homelabops.html"
+        dest: "{{ aicorp_agent_dir }}/homelabops.html"
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Copy the Product Manager source to control01
+      ansible.builtin.copy:
+        src: "{{ aicorp_apps_source_dir }}/agent/product_manager.py"
+        dest: "{{ aicorp_agent_dir }}/product_manager.py"
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Copy the CTO source to control01
+      ansible.builtin.copy:
+        src: "{{ aicorp_apps_source_dir }}/agent/cto.py"
+        dest: "{{ aicorp_agent_dir }}/cto.py"
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Copy worker sources to control01
+      ansible.builtin.copy:
+        src: "{{ aicorp_apps_source_dir }}/agent/workers.py"
+        dest: "{{ aicorp_agent_dir }}/workers.py"
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Copy execution workflow source to control01
+      ansible.builtin.copy:
+        src: "{{ aicorp_apps_source_dir }}/agent/execution.py"
+        dest: "{{ aicorp_agent_dir }}/execution.py"
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Install governed deployment worker
+      ansible.builtin.copy:
+        src: "{{ aicorp_apps_source_dir }}/deployment-worker.py"
+        dest: "{{ aicorp_deployment_worker_file }}"
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Install governed deployment worker service
+      ansible.builtin.copy:
+        dest: "{{ aicorp_deployment_worker_unit }}"
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=AICorp governed deployment worker
+          After=docker.service network-online.target
+          Wants=network-online.target
+
+          [Service]
+          Type=simple
+          WorkingDirectory={{ aicorp_base_dir }}
+          EnvironmentFile={{ aicorp_external_env_file }}
+          Environment=AICORP_DEPLOYMENT_ROOT={{ aicorp_base_dir }}
+          Environment=AICORP_COMPOSE_FILE={{ aicorp_compose_file }}
+          ExecStart=/usr/bin/python3 {{ aicorp_deployment_worker_file }}
+          Restart=always
+          RestartSec=10
+
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: Copy approved AICorp knowledge documents to control01
+      ansible.builtin.copy:
+        src: "{{ item.src }}"
+        dest: "{{ item.dest }}"
+        owner: root
+        group: root
+        mode: "0644"
+      loop:
+        - src: "{{ aicorp_umbrella_source_dir }}/README.md"
+          dest: "{{ aicorp_knowledge_dir }}/README.md"
+        - src: "{{ aicorp_umbrella_source_dir }}/docs/PROJECT.md"
+          dest: "{{ aicorp_knowledge_dir }}/docs/PROJECT.md"
+        - src: "{{ aicorp_umbrella_source_dir }}/docs/DECISIONS.md"
+          dest: "{{ aicorp_knowledge_dir }}/docs/DECISIONS.md"
+        - src: "{{ aicorp_umbrella_source_dir }}/docs/RUNBOOK.md"
+          dest: "{{ aicorp_knowledge_dir }}/docs/RUNBOOK.md"
+
+    - name: Reconcile AICorp platform services
+      community.docker.docker_compose_v2:
+        project_src: "{{ aicorp_base_dir }}"
+        state: present
+        build: always
+        pull: missing
+        wait: true
+        wait_timeout: 120
+
+    - name: Install host PostgreSQL driver for governed deployment worker
+      ansible.builtin.apt:
+        name: python3-psycopg
+        state: present
+        update_cache: true
+
+    - name: Enable and start governed deployment worker
+      ansible.builtin.systemd:
+        name: aicorp-deployment-worker.service
+        enabled: true
+        state: restarted
+        daemon_reload: true

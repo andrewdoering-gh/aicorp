@@ -4,7 +4,7 @@
 
 This document records significant architectural, operational, security, and governance decisions for AICorp.
 
-AICorp is organized as one project repository with the `aicorp-iac`, `aicorp-config`, and `aicorp-apps` child repositories. These decisions provide the shared architectural baseline for all four layers.
+AICorp is organized as one project repository with the `aicorp-iac`, `aicorp-config`, and `aicorp-apps` project folders. These decisions provide the shared architectural baseline for the four project areas.
 
 ## Decision Statuses
 

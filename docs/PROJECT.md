@@ -244,7 +244,7 @@ Agent decisions, tool calls, approvals, failures, and significant state transiti
 
 ## Repository Architecture
 
-AICorp is one repository with three scoped child repositories.
+AICorp is one repository with three scoped project folders.
 
 AICorp
 ├── aicorp-iac

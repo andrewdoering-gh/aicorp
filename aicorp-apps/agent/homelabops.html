@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>HomeLabOps</title>
+  <style>
+    :root { --ink: #17211b; --muted: #65736a; --paper: #f4f1e8; --panel: #fffdf7; --line: #d8d6ca; --green: #2d6a4f; --amber: #b66a22; --red: #a33b32; }
+    * { box-sizing: border-box; }
+    body { margin: 0; color: var(--ink); background: radial-gradient(circle at 12% 0%, #e8eee2 0, var(--paper) 38rem); font: 15px/1.5 Georgia, serif; }
+    main { max-width: 1180px; margin: 0 auto; padding: 42px 24px 64px; }
+    header { display: flex; align-items: flex-end; justify-content: space-between; gap: 24px; border-bottom: 1px solid var(--line); padding-bottom: 26px; }
+    h1, h2, p { margin: 0; } h1 { font: 700 clamp(2.5rem, 7vw, 5.5rem)/.9 Georgia, serif; letter-spacing: -0.04em; } h2 { font-size: 1.2rem; }
+    .kicker { color: var(--green); font: 700 .75rem/1.2 Arial, sans-serif; letter-spacing: .16em; text-transform: uppercase; margin-bottom: 12px; }
+    .dek { max-width: 420px; color: var(--muted); font-size: 1.05rem; }
+    .toolbar { display: flex; align-items: center; gap: 12px; margin: 24px 0; font-family: Arial, sans-serif; }
+    button { border: 1px solid var(--ink); background: var(--ink); color: white; padding: 10px 15px; cursor: pointer; font-weight: 700; } button:hover { background: var(--green); }
+    #updated { color: var(--muted); font-size: .85rem; }
+    .grid { display: grid; grid-template-columns: repeat(12, 1fr); gap: 14px; }
+    .panel { background: color-mix(in srgb, var(--panel) 88%, transparent); border: 1px solid var(--line); padding: 20px; min-height: 150px; }
+    .summary { grid-column: span 5; } .targets { grid-column: span 7; } .alerts { grid-column: span 7; } .report { grid-column: span 5; }
+    .metric { font: 700 3.5rem/1 Arial, sans-serif; margin: 12px 0 4px; } .healthy { color: var(--green); } .warning { color: var(--amber); } .critical { color: var(--red); }
+    .subtle { color: var(--muted); font: .82rem/1.4 Arial, sans-serif; }
+    table { border-collapse: collapse; width: 100%; margin-top: 14px; font: .9rem Arial, sans-serif; } th, td { border-bottom: 1px solid var(--line); padding: 9px 5px; text-align: left; } th { color: var(--muted); font-size: .72rem; text-transform: uppercase; letter-spacing: .08em; }
+    .pill { display: inline-block; padding: 3px 7px; font: 700 .7rem Arial, sans-serif; text-transform: uppercase; } .pill.up { color: var(--green); background: #dcebdd; } .pill.down { color: var(--red); background: #f3d9d5; } .pill.firing { color: var(--amber); background: #f4e3c9; }
+    .pill.critical { color: var(--red); background: #f3d9d5; } .pill.warning { color: var(--amber); background: #f4e3c9; } .pill.info { color: var(--green); background: #dcebdd; }
+    pre { white-space: pre-wrap; font: .9rem/1.55 Arial, sans-serif; color: #334139; margin: 14px 0 0; } .empty { color: var(--muted); margin-top: 14px; }
+    footer { color: var(--muted); border-top: 1px solid var(--line); margin-top: 28px; padding-top: 15px; font: .75rem Arial, sans-serif; }
+    @media (max-width: 760px) { main { padding: 26px 16px 44px; } header { display: block; } .dek { margin-top: 20px; } .summary, .targets, .alerts, .report { grid-column: 1 / -1; } }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <div><div class="kicker">AICorp prototype</div><h1>HomeLabOps</h1></div>
+      <p class="dek">A calm operational read on what is running, what needs attention, and what the evidence says.</p>
+    </header>
+    <div class="toolbar"><button id="refresh" type="button">Refresh status</button><span id="updated">Loading...</span></div>
+    <section class="grid">
+      <article class="panel summary"><h2>System posture</h2><div id="posture" class="metric">--</div><p id="posture-detail" class="subtle">Collecting evidence from monitoring.</p></article>
+      <article class="panel targets"><h2>Services</h2><div id="targets"></div></article>
+      <article class="panel alerts"><h2>Attention</h2><div id="alerts"></div></article>
+      <article class="panel report"><h2>Latest operator brief</h2><div id="report"></div></article>
+    </section>
+    <footer>Read-only prototype. HomeLabOps reports evidence; it does not restart services, change infrastructure, or bypass approval.</footer>
+  </main>
+  <script>
+    const escapeHtml = (value) => String(value ?? '').replace(/[&<>'"]/g, (char) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;' }[char]));
+    const render = (data) => {
+      const targets = data.targets || [], alerts = data.alerts || [];
+      const healthy = targets.filter((target) => target.health === 'up').length;
+      const posture = alerts.length ? 'Attention' : (targets.length && healthy === targets.length ? 'Healthy' : 'Unknown');
+      const postureClass = posture === 'Healthy' ? 'healthy' : posture === 'Attention' ? 'warning' : 'critical';
+      document.querySelector('#posture').textContent = posture;
+      document.querySelector('#posture').className = `metric ${postureClass}`;
+      document.querySelector('#posture-detail').textContent = `${healthy} of ${targets.length} monitored services responding; ${alerts.length} active alert${alerts.length === 1 ? '' : 's'}.`;
+      document.querySelector('#targets').innerHTML = targets.length ? `<table><thead><tr><th>Service</th><th>Address</th><th>State</th></tr></thead><tbody>${targets.map((target) => `<tr><td>${escapeHtml(target.job)}</td><td>${escapeHtml(target.instance)}</td><td><span class="pill ${target.health === 'up' ? 'up' : 'down'}">${escapeHtml(target.health || 'unknown')}</span></td></tr>`).join('')}</tbody></table>` : '<p class="empty">No monitored services reported.</p>';
+      const severityClass = (severity) => ['critical', 'warning', 'info'].includes(String(severity).toLowerCase()) ? String(severity).toLowerCase() : 'info';
+      document.querySelector('#alerts').innerHTML = alerts.length ? `<table><thead><tr><th>Alert</th><th>Severity</th><th>Summary</th></tr></thead><tbody>${alerts.map((alert) => `<tr><td>${escapeHtml(alert.name)}</td><td><span class="pill ${severityClass(alert.severity)}">${escapeHtml(alert.severity || 'unknown')}</span></td><td>${escapeHtml(alert.summary || 'No summary')}</td></tr>`).join('')}</tbody></table>` : '<p class="empty">No active alerts.</p>';
+      document.querySelector('#report').innerHTML = data.report ? `<p class="subtle">Completed ${escapeHtml(data.report.completed_at)}</p><pre>${escapeHtml(data.report.report)}</pre>` : '<p class="empty">No completed operator brief yet.</p>';
+      document.querySelector('#updated').textContent = `Updated ${new Date().toLocaleTimeString()}`;
+    };
+    const load = async () => { document.querySelector('#updated').textContent = 'Refreshing...'; try { const response = await fetch('/product-data', { cache: 'no-store' }); if (!response.ok) throw new Error('status unavailable'); render(await response.json()); } catch (error) { document.querySelector('#updated').textContent = 'Unable to load status'; } };
+    document.querySelector('#refresh').addEventListener('click', load); load();
+  </script>
+</body>
+</html>

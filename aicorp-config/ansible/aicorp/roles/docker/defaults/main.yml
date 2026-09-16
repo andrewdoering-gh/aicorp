@@ -1,0 +1,22 @@
+---
+docker_apt_repo_arch: "{{ 'arm64' if ansible_facts['architecture'] == 'aarch64' else 'amd64' }}"
+docker_apt_gpg_key_url: https://download.docker.com/linux/ubuntu/gpg
+docker_apt_keyring_path: /etc/apt/keyrings/docker.asc
+# Docker's repo may not yet publish packages for the host's codename; override if needed.
+docker_apt_repo_codename: "{{ ansible_facts['distribution_release'] }}"
+docker_apt_repo_line: >-
+  deb [arch={{ docker_apt_repo_arch }} signed-by={{ docker_apt_keyring_path }}]
+  https://download.docker.com/linux/ubuntu {{ docker_apt_repo_codename }} stable
+
+docker_packages:
+  - docker-ce
+  - docker-ce-cli
+  - containerd.io
+  - docker-buildx-plugin
+  - docker-compose-plugin
+
+docker_daemon_config:
+  log-driver: json-file
+  log-opts:
+    max-size: "{{ docker_log_max_size | default('10m') }}"
+    max-file: "{{ docker_log_max_file | default('3') }}"

@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+BACKUP_MOUNT="{{ aicorp_backup_mount }}"
+BACKUP_ROOT="{{ aicorp_backup_root }}"
+RETENTION="{{ aicorp_backup_retention }}"
+STAMP="$(date +%Y%m%d-%H%M%S)"
+DESTINATION="${BACKUP_ROOT}/${STAMP}"
+
+if ! mountpoint -q "$BACKUP_MOUNT"; then
+  echo "Backup mount is not available: $BACKUP_MOUNT" >&2
+  exit 1
+fi
+
+mkdir -p "$DESTINATION/restore-check"
+trap 'rm -rf "$DESTINATION/restore-check"' EXIT
+
+available_kb="$(df -Pk "$BACKUP_MOUNT" | awk 'NR==2 {print $4}')"
+required_kb=5242880
+if [ "$available_kb" -lt "$required_kb" ]; then
+  echo "Backup destination has less than 5 GiB available." >&2
+  exit 1
+fi
+
+cd /opt/aicorp
+
+echo "Creating PostgreSQL logical backup..."
+docker exec aicorp-postgres sh -c \
+  'PGPASSWORD="$POSTGRES_PASSWORD" pg_dump -U "$POSTGRES_USER" -d "$POSTGRES_DB" --format=custom --no-owner --no-privileges' \
+  > "$DESTINATION/aicorp-postgres.dump"
+
+if [ ! -s "$DESTINATION/aicorp-postgres.dump" ]; then
+  echo "PostgreSQL backup is empty." >&2
+  exit 1
+fi
+
+sha256sum "$DESTINATION/aicorp-postgres.dump" > "$DESTINATION/aicorp-postgres.dump.sha256"
+
+echo "Creating persistent-file backup..."
+tar --numeric-owner --xattrs --acls -czf "$DESTINATION/aicorp-files.tar.gz" \
+  -C /opt/aicorp \
+  data/redis \
+  data/qdrant \
+  data/open-webui \
+  data/prometheus \
+  data/alertmanager \
+  config/litellm \
+  config/prometheus \
+  config/alertmanager \
+  knowledge
+
+sha256sum "$DESTINATION/aicorp-files.tar.gz" > "$DESTINATION/aicorp-files.tar.gz.sha256"
+
+( cd "$DESTINATION"; sha256sum -c aicorp-postgres.dump.sha256; sha256sum -c aicorp-files.tar.gz.sha256 )
+
+test -s "$DESTINATION/aicorp-postgres.dump"
+test -s "$DESTINATION/aicorp-files.tar.gz"
+chmod 0600 "$DESTINATION"/*
+
+find "$BACKUP_ROOT" -mindepth 1 -maxdepth 1 -type d -printf '%T@ %p\n' \
+  | sort -nr \
+  | awk 'NR > {{ aicorp_backup_retention }} {sub(/^[^ ]+ /, ""); print}' \
+  | xargs -r -d '\n' rm -rf
+
+echo "Backup completed: $DESTINATION"

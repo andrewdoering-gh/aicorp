@@ -1,0 +1,44 @@
+---
+target_hostname: aicorp-control01
+
+ubuntu_baseline_timezone: America/Los_Angeles
+ubuntu_baseline_upgrade_packages: true
+ubuntu_baseline_autoremove_packages: true
+
+ubuntu_baseline_packages:
+  - bash-completion
+  - ca-certificates
+  - curl
+  - git
+  - htop
+  - jq
+  - qemu-guest-agent
+  - rsync
+  - tmux
+  - tree
+  - unzip
+  - vim
+  - chrony
+
+docker_users:
+  - drew
+
+docker_log_max_size: "10m"
+docker_log_max_file: "3"
+
+# Docker's apt repo has no packages yet for Ubuntu 26.04 ("resolute"); pin to latest supported LTS.
+docker_apt_repo_codename: noble
+
+aicorp_base_dir: /opt/aicorp
+aicorp_directories:
+  - "{{ aicorp_base_dir }}"
+  - "{{ aicorp_base_dir }}/data"
+  - "{{ aicorp_base_dir }}/config"
+  - "{{ aicorp_base_dir }}/config/litellm"
+  - "{{ aicorp_base_dir }}/config/prometheus"
+  - "{{ aicorp_base_dir }}/config/alertmanager"
+  - "{{ aicorp_base_dir }}/config/alertmanager/rendered"
+  - "{{ aicorp_base_dir }}/logs"
+  - "{{ aicorp_base_dir }}/logs/litellm"
+  - "{{ aicorp_base_dir }}/data/prometheus"
+  - "{{ aicorp_base_dir }}/data/alertmanager"

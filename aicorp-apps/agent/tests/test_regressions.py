@@ -361,9 +361,63 @@ class RegressionTests(unittest.TestCase):
                 "work_item_id": "WS-01",
                 "failed_worker_plan_id": 11,
                 "execution_plan_repair_for_task_id": 57,
+                "execution_plan_repair_root_task_id": 57,
             },
         )
         audit.assert_called_once()
+
+    def test_worker_plan_rejects_files_outside_workstream_scope(self):
+        contract = build_requirement_contract(
+            17,
+            {"goals": ["Bounded execution"]},
+            [
+                {
+                    "id": "item",
+                    "title": "Execution item",
+                    "description": "Run bounded execution checks.",
+                    "priority": "now",
+                    "acceptance_criteria": ["Checks complete"],
+                    "dependencies": [],
+                    "goal_ids": ["GOAL-01"],
+                    "status": "ready",
+                }
+            ],
+        )
+        engineering_plan = {"workstreams": [{"id": "WS-01"}]}
+        base_worker = {
+            "role": "software_engineer",
+            "scope": ["WS-01"],
+            "implementation_steps": ["Run the bounded checks."],
+            "tests": ["Run the focused test."],
+            "risks": ["Evidence may be incomplete."],
+            "handoff": ["Submit factual evidence."],
+            "requirement_contract": contract,
+        }
+        invalid_worker = {**base_worker, "files_or_surfaces": ["aicorp/deployment-worker.py"]}
+        valid_worker = {**base_worker, "files_or_surfaces": ["aicorp/agent/agent.py"]}
+        with patch.object(
+            workers_module,
+            "_repository_paths",
+            return_value={
+                "aicorp/agent/agent.py",
+                "aicorp/agent/execution.py",
+                "aicorp/deployment-worker.py",
+            },
+        ), patch.object(
+            workers_module,
+            "_generate",
+            side_effect=[invalid_worker, valid_worker],
+        ) as generate:
+            result = workers_module.generate_worker_plan(
+                "http://test",
+                "key",
+                "model",
+                "software_engineer",
+                engineering_plan,
+            )
+
+        self.assertEqual(result["files_or_surfaces"], ["aicorp/agent/agent.py"])
+        self.assertEqual(generate.call_count, 2)
 
     def test_non_thinking_generation_sends_native_reasoning_controls(self):
         class FakeResponse:

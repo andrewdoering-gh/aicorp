@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from requirements import validate_requirement_contract
-from workstreams import WORKSTREAM_IDS
+from workstreams import WORKSTREAM_FILE_GROUPS, WORKSTREAM_IDS
 
 
 _GENERATION_LOCK = threading.Lock()
@@ -397,7 +397,21 @@ def generate_worker_plan(
     if role == "qa_engineer":
         logger.info("building deterministic QA worker plan from approved engineering plan")
         return build_qa_worker_plan(engineering_plan)
+    workstream_ids = [
+        str(workstream.get("id", "")).strip()
+        for workstream in engineering_plan.get("workstreams", [])
+        if isinstance(workstream, dict) and str(workstream.get("id", "")).strip()
+    ]
+    approved_paths = sorted({
+        path
+        for workstream_id in workstream_ids
+        for path in WORKSTREAM_FILE_GROUPS.get(workstream_id, ())
+    })
     available_paths = sorted(_repository_paths())
+    scoped_paths = [
+        path for path in approved_paths
+        if not available_paths or path in available_paths
+    ]
     prompt = (
         f"Act as the AICorp {role.replace('_', ' ').title()} worker. The role field must be exactly "
         f"'{role}'. Produce a planning handoff from the "
@@ -408,7 +422,7 @@ def generate_worker_plan(
         "into the response and do not return more than 8 files_or_surfaces entries. "
         "Copy the requirement_contract from the approved Engineering Manager plan exactly; do not omit, summarize, or alter it. "
         "Return JSON only.\n\n"
-        f"Available repository files (use only these for software_engineer files_or_surfaces): {available_paths}\n\n"
+        f"Approved repository files for these workstreams (use only these for software_engineer files_or_surfaces): {scoped_paths}\n\n"
         f"Approved engineering plan:\n{json.dumps(engineering_plan, indent=2, default=str)}\n\n"
         'Schema: {"role":"string","scope":["string"],"implementation_steps":["string"],'
         '"files_or_surfaces":["string"],"tests":["string"],"risks":["string"],"handoff":["string"],'
@@ -416,8 +430,29 @@ def generate_worker_plan(
     )
     system = f"You are a careful {role} worker. Output valid JSON only."
     payload = _generate(base_url, api_key, model, system, prompt, think=False)
+
+    def validate_generated_worker_plan(candidate: Any) -> dict[str, Any]:
+        normalized = validate_worker_output(candidate, role)
+        if role != "software_engineer":
+            return normalized
+        selected_paths = set(normalized["files_or_surfaces"])
+        invalid_paths = sorted(selected_paths - set(approved_paths))
+        uncovered_workstreams = [
+            workstream_id
+            for workstream_id in workstream_ids
+            if not selected_paths.intersection(WORKSTREAM_FILE_GROUPS.get(workstream_id, ()))
+        ]
+        if invalid_paths or uncovered_workstreams:
+            details = []
+            if invalid_paths:
+                details.append(f"invalid approved-scope paths: {', '.join(invalid_paths)}")
+            if uncovered_workstreams:
+                details.append(f"uncovered workstreams: {', '.join(uncovered_workstreams)}")
+            raise ValueError("files_or_surfaces must cover approved workstreams; " + "; ".join(details))
+        return normalized
+
     try:
-        return validate_worker_output(payload, role)
+        return validate_generated_worker_plan(payload)
     except ValueError as error:
         if role != "software_engineer" or "files_or_surfaces" not in str(error):
             raise
@@ -425,9 +460,9 @@ def generate_worker_plan(
             prompt
             + "\n\nYour previous response failed validation because files_or_surfaces was invalid. "
             "Regenerate the complete JSON response now. Select no more than 8 individual files from the "
-            "available repository files; do not include directories, prose, or the inventory itself."
+            "approved repository files for the listed workstreams; include at least one file for each workstream. "
+            "Do not include directories, prose, or the inventory itself."
         )
-        return validate_worker_output(
+        return validate_generated_worker_plan(
             _generate(base_url, api_key, model, system, correction_prompt, think=False),
-            role,
         )

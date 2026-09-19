@@ -1820,18 +1820,25 @@ def queue_execution_plan_repair(task_id: int) -> int | None:
         if failure.get("error_type") != "ExecutionConfigurationError":
             return None
         worker_context = source[6] if isinstance(source[6], dict) else {}
-        root_task_id = int(worker_context.get("execution_plan_repair_for_task_id", task_id))
+        raw_root_task_id = worker_context.get(
+            "execution_plan_repair_root_task_id",
+            worker_context.get("execution_plan_repair_for_task_id", task_id),
+        )
+        try:
+            root_task_id = int(raw_root_task_id)
+        except (TypeError, ValueError):
+            root_task_id = task_id
         existing = connection.execute(
             """
             SELECT id
             FROM agent_approval_requests
             WHERE action = 'generate_software_engineer_plan'
               AND status IN ('pending', 'approved')
-              AND context->>'execution_plan_repair_for_task_id' = %s
+                            AND context->>'execution_plan_repair_for_task_id' = %s
             ORDER BY id DESC
             LIMIT 1
             """,
-            (str(root_task_id),),
+            (str(task_id),),
         ).fetchone()
         if existing:
             return int(existing[0])
@@ -1840,7 +1847,10 @@ def queue_execution_plan_repair(task_id: int) -> int | None:
             SELECT count(*)
             FROM agent_approval_requests
             WHERE action = 'generate_software_engineer_plan'
-              AND context->>'execution_plan_repair_for_task_id' = %s
+                            AND COALESCE(
+                                        context->>'execution_plan_repair_root_task_id',
+                                        context->>'execution_plan_repair_for_task_id'
+                                    ) = %s
             """,
             (str(root_task_id),),
         ).fetchone()[0]
@@ -1867,7 +1877,8 @@ def queue_execution_plan_repair(task_id: int) -> int | None:
             "role": "software_engineer",
             "work_item_id": work_item_id,
             "failed_worker_plan_id": worker_plan_id,
-            "execution_plan_repair_for_task_id": root_task_id,
+            "execution_plan_repair_for_task_id": task_id,
+            "execution_plan_repair_root_task_id": root_task_id,
         },
     )
     with psycopg.connect(DATABASE_URL) as connection:

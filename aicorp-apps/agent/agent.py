@@ -109,6 +109,7 @@ AUTOMATIC_HANDOFF_MAX_ATTEMPTS = max(1, int(os.environ.get("AUTOMATIC_HANDOFF_MA
 AUTOMATIC_HANDOFF_RETRY_DELAY_SECONDS = max(0, int(os.environ.get("AUTOMATIC_HANDOFF_RETRY_DELAY_SECONDS", "5")))
 AUTOMATIC_DISPATCH_TIMEOUT_SECONDS = max(120, int(os.environ.get("AUTOMATIC_DISPATCH_TIMEOUT_SECONDS", "1860")))
 MAX_DEPLOYMENT_ATTEMPTS = max(1, int(os.environ.get("AICORP_MAX_DEPLOYMENT_ATTEMPTS", "3")))
+MAX_EXECUTION_PLAN_REPAIR_ATTEMPTS = max(1, int(os.environ.get("AICORP_MAX_EXECUTION_PLAN_REPAIR_ATTEMPTS", "3")))
 PLANNING_RESET_CONFIRMATION = "RESET_PLANNING_WORKSPACE"
 
 
@@ -174,6 +175,7 @@ def add_planning_generation(
         enriched["planning_generation"] = current_planning_generation(connection)
     return enriched
 
+    reconcile_execution_tasks_once()
 
 def planning_generation_matches(
     connection: psycopg.Connection,
@@ -1796,6 +1798,140 @@ def retry_failed_execution_task(task_id: int) -> int | None:
     return replacement_id
 
 
+def queue_execution_plan_repair(task_id: int) -> int | None:
+    """Regenerate an invalid worker plan instead of retrying the same scope."""
+    with psycopg.connect(DATABASE_URL) as connection:
+        source = connection.execute(
+            """
+            SELECT task.worker_plan_id, worker.engineering_plan_id, task.work_item_id,
+                   task.status, task.qa_result, worker.approval_request_id,
+                   worker_approval.context
+            FROM agent_execution_tasks AS task
+            JOIN agent_worker_plans AS worker ON worker.id = task.worker_plan_id
+            JOIN agent_approval_requests AS worker_approval
+              ON worker_approval.id = worker.approval_request_id
+            WHERE task.id = %s
+            """,
+            (task_id,),
+        ).fetchone()
+        if source is None or source[3] != "failed":
+            return None
+        failure = source[4] if isinstance(source[4], dict) else {}
+        if failure.get("error_type") != "ExecutionConfigurationError":
+            return None
+        worker_context = source[6] if isinstance(source[6], dict) else {}
+        root_task_id = int(worker_context.get("execution_plan_repair_for_task_id", task_id))
+        existing = connection.execute(
+            """
+            SELECT id
+            FROM agent_approval_requests
+            WHERE action = 'generate_software_engineer_plan'
+              AND status IN ('pending', 'approved')
+              AND context->>'execution_plan_repair_for_task_id' = %s
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (str(root_task_id),),
+        ).fetchone()
+        if existing:
+            return int(existing[0])
+        attempts = connection.execute(
+            """
+            SELECT count(*)
+            FROM agent_approval_requests
+            WHERE action = 'generate_software_engineer_plan'
+              AND context->>'execution_plan_repair_for_task_id' = %s
+            """,
+            (str(root_task_id),),
+        ).fetchone()[0]
+        if attempts >= MAX_EXECUTION_PLAN_REPAIR_ATTEMPTS:
+            if attempts == MAX_EXECUTION_PLAN_REPAIR_ATTEMPTS:
+                record_audit_event(
+                    connection,
+                    EXECUTION_AGENT_NAME,
+                    "execution_plan_repair_exhausted",
+                    EXECUTION_AGENT_NAME,
+                    str(root_task_id),
+                    {"failed_task_id": task_id, "attempts": attempts},
+                )
+                connection.commit()
+            return None
+        engineering_plan_id = int(source[1])
+        worker_plan_id = int(source[0])
+        work_item_id = str(source[2])
+    approval_id = queue_generation_approval(
+        "generate_software_engineer_plan",
+        ENGINEERING_MANAGER_NAME,
+        {
+            "engineering_plan_id": engineering_plan_id,
+            "role": "software_engineer",
+            "work_item_id": work_item_id,
+            "failed_worker_plan_id": worker_plan_id,
+            "execution_plan_repair_for_task_id": root_task_id,
+        },
+    )
+    with psycopg.connect(DATABASE_URL) as connection:
+        record_audit_event(
+            connection,
+            EXECUTION_AGENT_NAME,
+            "execution_plan_repair_requested",
+            ENGINEERING_MANAGER_NAME,
+            str(task_id),
+            {
+                "approval_id": approval_id,
+                "failed_worker_plan_id": worker_plan_id,
+                "engineering_plan_id": engineering_plan_id,
+                "work_item_id": work_item_id,
+                "attempt": attempts + 1,
+            },
+        )
+        connection.commit()
+    return approval_id
+
+
+def reconcile_execution_tasks_once() -> None:
+    """Start governed replacement work for execution failures needing reconciliation."""
+    with psycopg.connect(DATABASE_URL) as connection:
+        qa_failed_tasks = connection.execute(
+            """
+            SELECT task.id
+            FROM agent_execution_tasks AS task
+            WHERE task.status = 'qa_failed'
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM agent_approval_requests AS approval
+                  WHERE approval.action = 'start_software_engineer_execution'
+                    AND approval.context->>'replacement_for_task_id' = task.id::text
+              )
+            ORDER BY task.id
+            """
+        ).fetchall()
+        configuration_failed_tasks = connection.execute(
+            """
+            SELECT task.id
+            FROM agent_execution_tasks AS task
+            JOIN agent_worker_plans AS worker ON worker.id = task.worker_plan_id
+            JOIN agent_engineering_plans AS engineering ON engineering.id = worker.engineering_plan_id
+            JOIN agent_technical_plans AS technical ON technical.id = engineering.technical_plan_id
+            JOIN agent_product_briefs AS brief ON brief.id = technical.product_brief_id
+            WHERE task.status = 'failed'
+              AND task.qa_result->>'error_type' = 'ExecutionConfigurationError'
+              AND brief.status <> 'archived'
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM agent_approval_requests AS approval
+                  WHERE approval.action = 'generate_software_engineer_plan'
+                    AND approval.context->>'execution_plan_repair_for_task_id' = task.id::text
+              )
+            ORDER BY task.id
+            """
+        ).fetchall()
+    for (task_id,) in qa_failed_tasks:
+        retry_failed_execution_task(int(task_id))
+    for (task_id,) in configuration_failed_tasks:
+        queue_execution_plan_repair(int(task_id))
+
+
 def submit_execution_evidence(task_id: int, implementation: dict[str, object]) -> None:
     """Submit factual evidence for a supported in-progress implementation task."""
     approval_id = auto_approve_handoff(
@@ -2808,6 +2944,7 @@ def execution_worker_loop() -> None:
     while True:
         try:
             run_execution_worker_once()
+            reconcile_execution_tasks_once()
         except Exception as error:
             logger.exception("execution worker iteration failed: error=%s", type(error).__name__)
         time.sleep(EXECUTION_WORKER_INTERVAL_SECONDS)
@@ -5827,6 +5964,7 @@ def main() -> None:
         logger.warning("approval API disabled: AGENT_APPROVAL_TOKEN is not configured")
     init_database()
     start_report_server()
+    reconcile_execution_tasks_once()
     threading.Thread(target=execution_worker_loop, daemon=True).start()
     threading.Thread(target=qa_worker_loop, daemon=True).start()
     threading.Thread(target=work_item_orchestrator_loop, daemon=True).start()

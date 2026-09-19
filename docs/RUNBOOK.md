@@ -438,6 +438,16 @@ failures. A proposal or workflow may be complete while the Product Brief is
 still blocked. Product completion requires every mapped requirement and goal to
 have passing executable evidence.
 
+If an execution task fails before repository mutation because its approved
+worker plan has invalid or empty repository scope, the task remains preserved
+as `failed` and the execution worker records the configuration error. The
+agent reconciles that failure by automatically requesting a bounded replacement
+Software Engineer plan for the same Engineering Plan; it does not blindly
+rerun the invalid scope. Once the replacement plan is approved, the normal
+work-item orchestrator creates the replacement execution task. The default
+repair limit is three attempts and can be overridden with
+`AICORP_MAX_EXECUTION_PLAN_REPAIR_ATTEMPTS`.
+
 After the human deployment approval, the deployment worker runs the live
 acceptance suite against the restarted service. It verifies the dashboard,
 device discovery, authenticated heartbeats, offline and resolved alert

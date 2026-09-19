@@ -254,7 +254,7 @@ class RegressionTests(unittest.TestCase):
 
         auto_handoff.assert_not_called()
 
-    def test_deterministic_execution_scope_failure_is_terminal(self):
+    def test_deterministic_execution_scope_failure_is_recorded(self):
         class FakeResult:
             def __init__(self, rows=(), row=None):
                 self.rows = list(rows)
@@ -306,6 +306,63 @@ class RegressionTests(unittest.TestCase):
         update_sql, update_parameters = failure_connection.statements[0]
         self.assertIn("SET status = 'failed'", update_sql)
         self.assertEqual(update_parameters[-1], 15)
+        audit.assert_called_once()
+
+    def test_failed_execution_configuration_queues_worker_plan_repair(self):
+        class FakeResult:
+            def __init__(self, row=None):
+                self.row = row
+
+            def fetchone(self):
+                return self.row
+
+        class FakeConnection:
+            def __init__(self, source=False):
+                self.source = source
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc_value, traceback):
+                return False
+
+            def execute(self, statement, parameters=()):
+                if self.source and "SELECT task.worker_plan_id" in statement:
+                    return FakeResult((11, 51, "WS-01", "failed", {"error_type": "ExecutionConfigurationError"}, 378, {}))
+                if "SELECT id" in statement and "execution_plan_repair_for_task_id" in statement:
+                    return FakeResult()
+                if "SELECT count(*)" in statement:
+                    return FakeResult((0,))
+                raise AssertionError(f"unexpected SQL: {statement}")
+
+            def commit(self):
+                pass
+
+        source_connection = FakeConnection(source=True)
+        audit_connection = FakeConnection()
+        with patch.object(
+            agent_module.psycopg,
+            "connect",
+            side_effect=[source_connection, audit_connection],
+        ), patch.object(
+            agent_module,
+            "queue_generation_approval",
+            return_value=901,
+        ) as queue_generation, patch.object(agent_module, "record_audit_event") as audit:
+            result = agent_module.queue_execution_plan_repair(57)
+
+        self.assertEqual(result, 901)
+        queue_generation.assert_called_once_with(
+            "generate_software_engineer_plan",
+            agent_module.ENGINEERING_MANAGER_NAME,
+            {
+                "engineering_plan_id": 51,
+                "role": "software_engineer",
+                "work_item_id": "WS-01",
+                "failed_worker_plan_id": 11,
+                "execution_plan_repair_for_task_id": 57,
+            },
+        )
         audit.assert_called_once()
 
     def test_non_thinking_generation_sends_native_reasoning_controls(self):

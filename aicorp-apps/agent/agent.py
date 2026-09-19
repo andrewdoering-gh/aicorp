@@ -3518,7 +3518,7 @@ class ReportHandler(BaseHTTPRequestHandler):
                           WHERE brief.status <> 'archived'
                           ORDER BY task.created_at DESC LIMIT %s
                     """,
-                    (1 if self.path.endswith("/latest") else 50,),
+                    (1 if self.path.endswith("/latest") else 75,),
                 ).fetchall()
             fields = ("id", "worker_plan_id", "work_item_id", "requested_by", "start_approval_id", "status", "implementation", "qa_result", "qa_plan_id", "created_at", "updated_at")
             tasks = [dict(zip(fields, row)) for row in rows]

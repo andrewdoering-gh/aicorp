@@ -36,9 +36,9 @@ GITHUB_TOKEN
 OLLAMA_BASE_URL
 ```
 
-Hosted inference uses the LiteLLM route `gpt-4o-mini`, backed by the OpenAI API
-and the protected `OPENAI_API_KEY` value. Keep the key only in
-`/opt/aicorp/.env`; never commit it or print it in logs.
+Local inference uses the LiteLLM route `local-qwen3.5-9b`, backed by the Ollama
+endpoint in `OLLAMA_BASE_URL`. Hosted routes remain available for explicit
+overrides, but are not required for the default configuration.
 
 `DATABASE_URL` must use the PostgreSQL service hostname `postgres` and the
 `aicorp` database user and database. URL-encode any special characters in the
@@ -99,12 +99,23 @@ Prometheus also scrapes the agent metrics endpoint. The initial operational
 alerts cover agent availability, failed agent runs, and approval requests that
 remain pending for more than 30 minutes.
 
-## HomeLabOps Product Prototype
+## HomeLabOps Product Delivery
 
-HomeLabOps is the first product prototype built on the AICorp platform. It is
-an operator-facing read-only console for quickly understanding the state of a
-small homelab. It combines monitored service health, active alerts, and the
-latest health-summary report into one focused view.
+HomeLabOps is the first product built on the AICorp platform. The deployed MVP
+is an operator-facing read-only console backed by persisted PostgreSQL state.
+It records discovered devices, hardware metadata, last-known status, discovery
+events, threshold transitions, notification delivery state, monitored service
+health, and the latest health-summary report.
+
+The first Product Brief delivery contract is:
+
+- Core Dashboard MVP: load within two seconds, show discovered devices, and display last-known status.
+- Device Discovery Agent: detect standard home-server hardware and report discovery events to the dashboard.
+- Basic Alerting System: trigger on defined thresholds and deliver notifications through the configured channel.
+
+Broader Product Brief goals remain blocked until their own mapped requirements
+are implemented and accepted. A successful patch, build, QA review, or workflow
+handoff is not product completion.
 
 After deployment, access it through an SSH tunnel to the control plane:
 
@@ -118,26 +129,62 @@ Then open:
 http://127.0.0.1:8081/product
 ```
 
-The prototype is deliberately read-only. It does not execute commands, change
+The console is deliberately read-only. It does not execute commands, change
 infrastructure, restart services, access secrets, or bypass the approval
-workflow. Its first product hypothesis is that homelab operators need a calm,
-evidence-based operational brief rather than separate monitoring screens and
-agent conversations.
+workflow. Device discovery and heartbeat writes are authenticated and audited:
 
-## Local Model Fallback
+```text
+GET  /product-data
+GET  /devices
+POST /devices/discovery
+POST /devices/heartbeat
+```
 
-Ollama runs on the desktop outside the AICorp IaC environment. LiteLLM keeps
-`gpt-4o-mini` as the default route and falls back to
-`local-qwen3.5-9b` through the external `OLLAMA_BASE_URL` when the hosted
-route fails. Thinking output is disabled for this route for compatibility with
-the pinned LiteLLM version; local inference is CPU-bound and is not a
-replacement for hosted model quality.
+The configured `AICORP_DEVICE_STALE_SECONDS` threshold drives firing and
+resolved device alerts. `AICORP_TEAMS_WEBHOOK_URL` enables the durable
+notification channel; a deployment cannot pass product acceptance while that
+channel is disabled.
+
+After a human-approved deployment, the governed deployment worker runs the
+executable product acceptance suite against the restarted runtime. Evidence
+records the request, expected and actual result, timestamp, service/version,
+and source hash in `agent_deployment_runs.evidence`. Deployment is marked
+`completed` only when every Product Brief acceptance criterion passes.
+
+When the active planning state no longer represents the intended product,
+operators can use the authenticated `GET /planning-reset/preview` and
+`POST /planning-reset/request` routes to request a governed reset. A human
+approval archives active Product Briefs and supersedes nonterminal planning
+descendants without deleting rows, runtime state, audit history, or completed
+deployment evidence. The reset advances the planning generation; stale
+generation approvals and deployment claims cannot repopulate the new workspace.
+Running deployments block the reset until they finish.
+
+Operators can inspect the complete delivery chain through:
+
+```text
+GET /product-briefs/{id}/delivery-status
+```
+
+## Local Model
+
+Ollama runs on the desktop outside the AICorp IaC environment. LiteLLM routes
+all default agent requests to `local-qwen3.5-9b` through its native
+`ollama_chat` provider and the root external `OLLAMA_BASE_URL` (without `/v1`).
+Planning generations may use reasoning, while repository proposal generations
+disable reasoning and use a bounded JSON output budget so the 64K model context
+is not consumed by hidden thinking.
 
 The local model is available through LiteLLM using the model name
 `local-qwen3.5-9b`. The desktop must expose Ollama on a reachable address,
 for example `http://desktop-host.example:11434`, and its firewall must allow
 the control-plane address. Keep the real desktop URL in the protected
 `/opt/aicorp/.env` file.
+
+For an Open WebUI custom model backed by `local-qwen3.5-9b`, set Function
+Calling to `default`, not `native`. The LiteLLM `ollama_chat` route returns a
+JSON tool-selection envelope rather than an OpenAI `tool_calls` response; the
+default Open WebUI handler parses and executes that envelope.
 
 ## Persistent Agent
 
@@ -151,7 +198,7 @@ environment file when needed:
 
 ```text
 AGENT_NAME=aicorp-health-summary
-AGENT_MODEL=gpt-4o-mini
+AGENT_MODEL=local-qwen3.5-9b
 AGENT_INTERVAL_SECONDS=3600
 ```
 
@@ -268,8 +315,9 @@ brief. `approve_technical_plan` publishes the resulting technical plan only
 after a separate human approval.
 
 The repository includes an Open WebUI governance Tool at
-`open-webui/functions/aicorp_approval_workflow.py`. Import it through the
-administrator interface and configure its valves:
+`open-webui/functions/aicorp_approval_workflow.py`. Import or update it through
+Open WebUI **Workspace -> Tools** (not the Admin -> Functions registry), then
+configure its valves:
 
 ```text
 agent_url=http://agent:8081
@@ -280,6 +328,41 @@ agent_name=<configured agent identity when delegated>
 
 Use it to list pending requests and record an explicit human approval or denial.
 It changes only the approval ledger; it cannot execute the requested action.
+
+`list_pending_approvals` is terminal and read-only: it lists records and must
+not be followed by an approval call. To make a decision, enter `approve <id>`
+or `deny <id>` in a new message. The tool resolves every pending approval type
+from its ID, including deployment retries and publication requests. A pending
+record returned by a list call is never consent; the new direct instruction is
+the operator's approval or denial.
+
+Failed deployment runs are terminal by default. The deployment worker never
+reclaims a failed run or silently restarts the agent again. To retry one,
+request a new governed approval from the failed deployment approval ID:
+
+```text
+POST /deployment-runs/{failed_deployment_approval_id}/retry
+{
+	"reason": "Corrected the deployment failure and verified the approved patch."
+}
+```
+
+This creates and automatically approves a governed `retry_deployment` request.
+The worker claims the retry only when its source run is failed, its planning
+generation is current, and the retry approval is approved. The original failed
+run and evidence remain unchanged.
+
+The proposal tool exposes the same request step as
+`request_deployment_retry`; the validated retry is approved automatically and
+will be picked up by the deployment worker.
+
+The same tool exposes a prompt-friendly planning reset flow. In an Open WebUI
+chat, ask to reset the planning workspace. The tool creates a pending reset
+approval and returns its scope. After reviewing the scope and request ID, send
+`approve <request_id>`. The API verifies that the request is a pending
+`reset_planning_workspace` request before recording the human approval; it
+never approves a different action or executes a reset without these explicit
+steps.
 
 For repository proposals, the Software Engineer should use the dedicated
 `request_repository_change_proposal_submission` tool to create the exact
@@ -324,6 +407,35 @@ publication approval, the archive submission and approval context must include
 with archival. Archived briefs and all plans, tasks, and proposals derived
 from them are excluded from normal collection/latest views, while direct ID
 lookups remain available for audit.
+
+When the active planning workspace no longer represents the intended goals,
+use the governed planning reset instead of deleting rows. First inspect the
+read-only scope:
+
+```text
+GET /planning-reset/preview
+```
+
+Then submit a reset request with a reason and either `confirm: true` or the
+exact confirmation phrase returned by the preview:
+
+```text
+POST /planning-reset/request
+```
+
+The request creates a pending human-only `reset_planning_workspace` approval;
+it does not change planning state. Approval through
+`POST /approval-requests/{id}` performs one transaction that archives every
+active Product Brief, marks nonterminal descendant plans and execution tasks
+as `superseded`, supersedes nonterminal repository proposals, cancels stale
+planning approvals, and advances the planning generation. A reset is blocked
+while a deployment run is active.
+
+The reset never deletes rows and never changes device, discovery, alert,
+notification, audit, or completed deployment evidence. Completed deployment
+runs remain available for historical delivery inspection. Automatic requests
+from the prior planning generation cannot create new artifacts; a new Product
+Brief request starts in the new generation.
 
 The PM agent does not claim customer demand has been validated. Its brief is a
 decision artifact for human review, not an autonomous product commitment.

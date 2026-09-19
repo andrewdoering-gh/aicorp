@@ -1,6 +1,8 @@
 import json
-import urllib.request
 from typing import Any
+
+from requirements import validate_requirement_contract
+from workers import REASONING_MAX_TOKENS, _generate
 
 
 CTO_REQUIRED_FIELDS = {
@@ -14,6 +16,7 @@ CTO_REQUIRED_FIELDS = {
     "engineering_backlog",
     "risks_and_open_decisions",
     "recommendation",
+    "requirement_contract",
 }
 TECHNICAL_BACKLOG_FIELDS = {
     "id",
@@ -85,6 +88,7 @@ def validate_technical_plan(payload: Any) -> dict[str, Any]:
         )
     normalized["engineering_backlog"] = normalized_backlog
     normalized["recommendation"] = payload["recommendation"].strip()
+    normalized["requirement_contract"] = validate_requirement_contract(payload["requirement_contract"])
     return normalized
 
 
@@ -103,6 +107,7 @@ def generate_technical_plan(
         "access or unrestricted infrastructure changes. Return JSON only.\n\n"
         "Approved product brief and any explicitly required dependencies:\n"
         f"{json.dumps(product_brief, indent=2, default=str)}\n\n"
+        "Copy the requirement_contract from the approved product brief exactly; do not omit, summarize, or alter it.\n"
         "Required JSON fields:\n"
         '{"feasibility":["string"],"architecture":["string"],'
         '"data_and_api_contracts":["string"],"security_model":["string"],'
@@ -111,27 +116,16 @@ def generate_technical_plan(
         '{"id":"string","title":"string","description":"string",'
         '"priority":"now|next|later","acceptance_criteria":["string"],'
         '"dependencies":["string"]}],"risks_and_open_decisions":["string"],'
-        '"recommendation":"string"}'
+        '"recommendation":"string","requirement_contract":{} }'
     )
-    request = urllib.request.Request(
-        f"{base_url.rstrip('/')}/v1/chat/completions",
-        data=json.dumps(
-            {
-                "model": model,
-                "messages": [
-                    {"role": "system", "content": "You are a careful CTO. Output valid JSON only."},
-                    {"role": "user", "content": prompt},
-                ],
-                **({} if model == "gpt-5.6-luna" else {"temperature": 0.2}),
-                "response_format": {"type": "json_object"},
-            }
-        ).encode("utf-8"),
-        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-        method="POST",
+    return validate_technical_plan(
+        _generate(
+            base_url,
+            api_key,
+            model,
+            "You are a careful CTO. Think through the architecture internally, then output valid JSON only.",
+            prompt,
+            max_tokens=REASONING_MAX_TOKENS,
+            think=True,
+        )
     )
-    with urllib.request.urlopen(request, timeout=90) as response:
-        content = json.load(response)["choices"][0]["message"]["content"].strip()
-    if content.startswith("```"):
-        content = content.split("\n", 1)[1].rsplit("```", 1)[0].strip()
-    decoded, _ = json.JSONDecoder().raw_decode(content)
-    return validate_technical_plan(decoded)

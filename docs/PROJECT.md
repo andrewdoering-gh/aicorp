@@ -40,6 +40,14 @@ The environment will combine:
 
 AICorp is intended to become a functioning engineering environment rather than only a simulation of conversations among AI personas.
 
+The first delivered product is HomeLabOps. Its MVP is a persisted,
+operator-facing read-only console for device discovery, last-known device
+status, monitored service health, threshold alerts, and notification delivery.
+The product is complete only when the approved Product Brief requirements and
+their mapped goals have passing executable evidence from the deployed runtime.
+Build success, workflow completion, or generated test descriptions alone do
+not satisfy product completion.
+
 AI agents will eventually be able to:
 
 - Interpret company objectives

@@ -395,12 +395,13 @@ contain secrets, or provider tokens in Git or in incident notes.
 
 Applications are managed from `aicorp-apps` with Docker Compose. Do not add or start application containers as part of the control-plane configuration milestone.
 
-### HomeLabOps Product Prototype
+### HomeLabOps Product Delivery
 
-The AICorp application repository includes the read-only HomeLabOps prototype.
-It presents monitored service health, active Prometheus alerts, and the latest
-completed agent brief in one operator view. It does not execute commands,
-change infrastructure, restart services, access secrets, or bypass approvals.
+The AICorp application repository includes the read-only HomeLabOps MVP. It
+uses persisted product state to present discovered devices, hardware metadata,
+last-known status, monitored service health, active alerts, notification state,
+and the latest completed agent brief. It does not execute commands, change
+infrastructure, restart services, access secrets, or bypass approvals.
 
 After deploying the platform, create a local SSH tunnel:
 
@@ -409,9 +410,107 @@ ssh -L 8081:127.0.0.1:8081 drew@control01.home.arpa
 ```
 
 Open `http://127.0.0.1:8081/product` in the local browser. The page reads its
-status from the agent's read-only `/product-data` endpoint. Treat this as a
-prototype product workflow, not a public service; do not expose port 8081
-outside the reviewed operator access path.
+status from the agent's read-only `/product-data` endpoint. Treat this as an
+operator service, not a public service; do not expose port 8081 outside the
+reviewed operator access path.
+
+The delivered Product Brief MVP is split into three mapped requirements:
+
+- Core Dashboard MVP: response within two seconds, discovered devices, and last-known status.
+- Device Discovery Agent: standard home-server hardware discovery and dashboard events.
+- Basic Alerting System: threshold transitions and notification delivery through the configured channel.
+
+The agent persists device, discovery-event, alert, and notification-outbox
+state in PostgreSQL. Discovery and heartbeat writes require the configured
+agent approval token. The `AICORP_DEVICE_STALE_SECONDS` value controls the
+offline threshold; `AICORP_TEAMS_WEBHOOK_URL` must be configured for alert
+delivery acceptance to pass.
+
+Inspect runtime delivery status with:
+
+```text
+GET /product-briefs/{id}/delivery-status
+```
+
+This endpoint reports the Product Brief contract, mapped requirements and
+goals, artifact lineage, deployment runs, acceptance evidence, and remaining
+failures. A proposal or workflow may be complete while the Product Brief is
+still blocked. Product completion requires every mapped requirement and goal to
+have passing executable evidence.
+
+After the human deployment approval, the deployment worker runs the live
+acceptance suite against the restarted service. It verifies the dashboard,
+device discovery, authenticated heartbeats, offline and resolved alert
+transitions, notification outbox delivery, response timing, runtime version,
+and source hash. It stores request, expected result, actual result, timestamp,
+service/version, and source-hash evidence. A deployment is not marked
+`completed` when any check fails.
+
+Failed deployment runs are terminal. The host deployment worker does not
+reclaim a failed run, reset it to `running`, or restart the agent on its own.
+The failed run and its evidence are preserved, then the worker automatically
+hands the failure to the responsible implementation agent. The agent receives
+the failed acceptance criteria and bounded deployment evidence, creates a new
+execution task, and proposes a corrective repository change within its approved
+scope. The original run and proposal remain unchanged.
+
+After QA approves the corrective proposal, the server creates and automatically
+approves a new `retry_deployment` request linked to both the original failed
+run and the replacement proposal. The operator can review the failure,
+remediation task, replacement proposal, and QA evidence while the deployment
+worker proceeds through its existing source-run, lineage, and acceptance
+checks:
+
+```text
+POST /deployment-runs/{failed_deployment_approval_id}/retry
+{
+  "reason": "Corrected the deployment failure and verified the approved patch."
+}
+```
+
+The route above remains available for a manual retry when no automatic
+remediation is needed. It creates and automatically approves the validated
+`retry_deployment` request; it does not bypass the failed-run, proposal
+lineage, planning-generation, predecessor, or post-deployment acceptance
+checks.
+
+The worker accepts the retry only when the source run is failed, the retry
+approval and target proposal are current and approved, the replacement belongs
+to the same responsible workstream, and predecessor workstreams are complete.
+The original failed run and its evidence remain unchanged. The worker creates
+a separate `agent_deployment_runs` row for the approved retry, which is the
+proof that execution actually started. In Open WebUI,
+`get_product_brief_delivery_status` shows the remediation execution task,
+replacement proposal, and retry approval IDs; `request_deployment_retry`
+creates the automatically approved retry request.
+
+If the agent or worker is unavailable when a failure is recorded, the
+deployment worker reconciles terminal failed runs on startup and during its
+poll loop. It selects the latest failed run for each proposal, so historical
+duplicate failures do not create duplicate remediation tasks.
+
+Automatic deployment remediation is bounded across replacement tasks. The
+default limit is three failed deployment attempts per worker plan and work
+item in the current planning generation; override it with
+`AICORP_MAX_DEPLOYMENT_ATTEMPTS` in the protected platform environment. Once
+the limit is reached, the source run evidence is marked exhausted, a
+`deployment_remediation_exhausted` audit event is recorded, and the worker
+does not create another execution task.
+
+To stop an already-created remediation fan-out, an authenticated operator can
+cancel the unfinished remediation lineage for a failed source run:
+
+```text
+POST /deployment-runs/{failed_deployment_approval_id}/break-retry-loop
+{
+  "reason": "Stop repeated acceptance failures while the deployment boundary is corrected."
+}
+```
+
+The route cancels linked remediation and deployment approvals, supersedes
+unfinished remediation tasks and proposals, marks the failed run exhausted,
+and records both the breaker and exhaustion audit events. Completed deployment
+runs are preserved.
 
 The Product Manager workflow is separate from this operational view. Request a
 new brief through the PM request workflow; the server automatically queues
@@ -426,6 +525,69 @@ If an approved repository proposal has mismatched evidence, supersede it rather
 than editing its audit history. Use the operator-only
 `POST /change-proposals/{id}/supersede` route with a reason, then submit a
 replacement execution record and proposal with matching file targets.
+
+### Reset Stale Planning State
+
+Use the planning reset when the active Product Briefs and their plans no longer
+represent the goals being pursued. This is a governed archival operation, not
+a database wipe. It does not remove runtime product state, completed
+deployment evidence, audit history, notification records, device discovery,
+or alert state.
+
+Preview the exact scope through an authenticated operator session:
+
+```text
+GET /planning-reset/preview
+```
+
+The preview reports the current planning generation, active Product Brief IDs,
+descendant plan/task/proposal IDs, cancelable approvals, active deployment
+runs, and completed deployment approvals that will be preserved.
+
+Submit the reset request only after reviewing that preview:
+
+```text
+POST /planning-reset/request
+{
+  "reason": "Previous Product Brief goals were not realized; start a new governed planning generation.",
+  "confirm": true
+}
+```
+
+The request is human-only and remains `pending`. Approve it through the normal
+approval ledger with a specific decision reason:
+
+```text
+POST /approval-requests/{id}
+{
+  "status": "approved",
+  "decision_reason": "Reviewed the reset scope and approve a clean planning generation."
+}
+```
+
+The imported Open WebUI Approval Workflow tool provides the same operation
+from a normal chat. Ask it to reset the planning workspace; it creates the
+pending request and returns the scope for review. After reviewing the returned
+request ID, send `approve <request_id>`. The tool verifies that the ID is
+still a pending `reset_planning_workspace` request before recording the
+operator approval.
+
+The Open WebUI approval tools treat listing as terminal and read-only. Approve
+or deny an approval in a separate direct instruction: `approve <request_id>`
+or `deny <request_id>`. A pending record returned by
+`list_pending_approvals` is never consent.
+
+Approval atomically archives all non-archived Product Briefs, supersedes every
+nonterminal descendant technical/engineering/worker plan and execution task,
+supersedes nonterminal repository proposals, cancels stale planning approvals,
+and increments the planning generation. Completed deployment runs are not
+cancelled or rewritten. A reset is refused while a deployment run is active.
+
+Do not execute SQL `DELETE` statements to clear planning state. After approval,
+request a new Product Brief through the normal PM workflow. Automatic
+generation, handoff, and deployment requests stamped with the previous
+generation are rejected or cancelled, so stale work cannot repopulate the new
+workspace.
 
 Artifact-generation approvals may be delegated to the upstream planning agent.
 Set these protected values in `/opt/aicorp/.env`:
@@ -450,9 +612,9 @@ the dispatcher cannot select an unrelated latest artifact.
 The CTO agent follows the approved PM artifact. It generates a technical plan
 only when the referenced product brief is already approved and the Product
 Manager agent has approved `generate_technical_plan`. Review the draft through
-`GET /technical-plans/latest`, then use a separate `approve_technical_plan`
-approval before publishing it. The CTO plan recommends architecture and work;
-it does not authorize implementation or infrastructure changes.
+`GET /technical-plans/latest`, then enter `approve <request_id>` for its
+pending `approve_technical_plan` request. The CTO plan recommends architecture
+and work; it does not authorize implementation or infrastructure changes.
 
 When a newly identified dependency makes the approved plan incomplete, request
 an amendment through `POST /technical-plans/amend` with the approved parent
@@ -561,14 +723,27 @@ ansible-playbook \
   --limit aicorp-control01
 ```
 
-Before running a backup, mount the approved backup storage at `/mnt/backup`.
-The script refuses to run when that mount is absent or has less than 5 GiB
-available.
+The playbook also installs and enables `aicorp-backup.timer`, which schedules
+one backup each day at approximately 03:15 with a small randomized delay. For
+the temporary single-host setup, `/mnt/backup` may be a directory on the
+control-plane root disk; the script emits a warning until durable storage is
+mounted there.
+
+The preferred configuration is to mount approved backup storage at
+`/mnt/backup`. Until that is available, the temporary directory fallback uses
+the control-plane root disk and still enforces the 5 GiB free-space check.
 
 Run manually on `control01`:
 
 ```bash
 sudo /usr/local/sbin/aicorp-backup
+```
+
+Check the scheduler and the last service result with:
+
+```bash
+systemctl list-timers aicorp-backup.timer
+systemctl status aicorp-backup.service
 ```
 
 The procedure creates:

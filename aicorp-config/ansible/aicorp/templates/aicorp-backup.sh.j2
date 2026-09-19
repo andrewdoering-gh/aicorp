@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+umask 077
 
 BACKUP_MOUNT="{{ aicorp_backup_mount }}"
 BACKUP_ROOT="{{ aicorp_backup_root }}"
@@ -7,9 +8,13 @@ RETENTION="{{ aicorp_backup_retention }}"
 STAMP="$(date +%Y%m%d-%H%M%S)"
 DESTINATION="${BACKUP_ROOT}/${STAMP}"
 
-if ! mountpoint -q "$BACKUP_MOUNT"; then
-  echo "Backup mount is not available: $BACKUP_MOUNT" >&2
+if [ ! -d "$BACKUP_MOUNT" ]; then
+  echo "Backup directory is not available: $BACKUP_MOUNT" >&2
   exit 1
+fi
+
+if ! mountpoint -q "$BACKUP_MOUNT"; then
+  echo "WARNING: $BACKUP_MOUNT is not a separate mount; backup is using the control-plane root disk." >&2
 fi
 
 mkdir -p "$DESTINATION/restore-check"

@@ -13,7 +13,11 @@ from pydantic import BaseModel, Field
 
 
 class Tools:
-    """Read-only access to published AICorp planning artifacts."""
+    """Read-only access to published AICorp planning artifacts only.
+
+    This tool does not list pending human approval requests. Use
+    list_pending_approvals from AICorp Approval Workflow for approvals.
+    """
 
     def __init__(self):
         self.valves = self.Valves()
@@ -57,6 +61,14 @@ class Tools:
         path = "/product-briefs?include_archived=true" if include_archived else "/product-briefs"
         return json.dumps(self._request(path), indent=2, default=str)
 
+    async def get_product_brief_delivery_status(self, brief_id: int) -> str:
+        """Show the Product Brief contract, downstream lineage, deployed evidence, and remaining failures."""
+        return json.dumps(
+            self._request(f"/product-briefs/{int(brief_id)}/delivery-status"),
+            indent=2,
+            default=str,
+        )
+
     async def get_latest_technical_plan(self) -> str:
         """Show the latest persisted CTO technical plan."""
         return json.dumps(self._request("/technical-plans/latest"), indent=2, default=str)
@@ -66,5 +78,10 @@ class Tools:
         return json.dumps(self._request("/engineering-plans/latest"), indent=2, default=str)
 
     async def list_worker_plans(self) -> str:
-        """Show persisted Software Engineer and QA worker plans."""
+        """Show persisted Software Engineer and QA worker plans only.
+
+        This is for planning artifacts, not pending human approval requests.
+        Never use this tool to list approvals; use list_pending_approvals
+        from AICorp Approval Workflow instead.
+        """
         return json.dumps(self._request("/worker-plans"), indent=2, default=str)

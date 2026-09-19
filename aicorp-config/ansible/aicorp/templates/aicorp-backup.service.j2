@@ -1,0 +1,13 @@
+[Unit]
+Description=AICorp durable backup
+RequiresMountsFor={{ aicorp_backup_mount }}
+After=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/aicorp-backup
+Nice=10
+IOSchedulingClass=best-effort
+
+[Install]
+WantedBy=multi-user.target

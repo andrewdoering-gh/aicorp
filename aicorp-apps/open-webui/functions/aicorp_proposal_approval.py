@@ -1,6 +1,6 @@
 """
 title: AICorp Proposal Approval
-version: 0.1.0
+version: 0.4.0
 author: AICorp
 """
 
@@ -13,7 +13,11 @@ from pydantic import BaseModel, Field
 
 
 class Tools:
-    """Small approval tool for reviewing and approving one repository proposal."""
+    """Read repository proposals and request an automatically approved deployment retry.
+
+    This tool is inspection and retry-request only. Retry requests are approved
+    automatically after the agent validates the failed deployment and proposal lineage.
+    """
 
     def __init__(self):
         self.valves = self.Valves()
@@ -65,20 +69,25 @@ class Tools:
             indent=2,
         )
 
-    async def approve_request(self, request_id: int) -> str:
-        """Approve a human gate; deploy approval authorizes asynchronous deployment."""
+    async def request_deployment_retry(
+        self,
+        source_approval_id: int,
+        reason: str,
+    ) -> str:
+        """MUTATING: create an automatically approved retry for one failed deployment.
+
+        This creates and approves a new governed retry request. The deployment
+        worker starts it after the validated request is persisted.
+        """
+        if not isinstance(reason, str) or not reason.strip():
+            return json.dumps({"error": "retry reason is required"}, indent=2)
         result = self._request(
-            f"/approval-requests/{request_id}",
+            f"/deployment-runs/{source_approval_id}/retry",
             method="POST",
-            payload={
-                "status": "approved",
-                "decided_by": "andrew",
-                "decision_reason": "Approve the final deployment of this QA-approved repository proposal.",
-            },
+            payload={"reason": reason},
         )
-        request = result.get("request", {}) if isinstance(result, dict) else {}
-        if request.get("action") == "deploy" and request.get("status") == "approved":
-            result["next_step"] = "Deployment worker is authorized and will execute asynchronously; verify agent_deployment_runs.status=completed."
+        if isinstance(result, dict) and result.get("action") == "retry_deployment":
+            result["next_step"] = "The validated retry request is approved automatically and will be picked up by the deployment worker."
         return json.dumps(result, indent=2, default=str)
 
     async def approve_repository_proposal(self, proposal_id: int = 2, approval_id: int = 0) -> str:

@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 import psycopg
+from notifications import enqueue_audit_notification, init_notification_tables
 
 AUTHORIZED_TOOLS: frozenset[str] = frozenset()
 APPROVAL_STATUSES = frozenset({"pending", "approved", "denied", "expired", "cancelled"})
@@ -38,7 +39,16 @@ AUTOMATED_HANDOFF_ACTIONS = frozenset(
         "review_repository_change",
     }
 )
-HUMAN_GATE_ACTIONS = frozenset({"approve_product_brief", "archive_product_brief", "deploy"})
+DEPLOYMENT_RETRY_ACTION = "retry_deployment"
+AUTOMATED_RETRY_ACTIONS = frozenset({DEPLOYMENT_RETRY_ACTION})
+HUMAN_GATE_ACTIONS = frozenset({"approve_product_brief", "archive_product_brief", "deploy", "reset_planning_workspace"})
+PLANNING_STATE_ID = 1
+PLANNING_ACTIONS = (
+    AUTO_DISPATCH_ACTIONS
+    | AUTOMATED_HANDOFF_ACTIONS
+    | HUMAN_GATE_ACTIONS
+    | AUTOMATED_RETRY_ACTIONS
+)
 
 
 def init_governance_tables(connection: psycopg.Connection) -> None:
@@ -77,6 +87,27 @@ def init_governance_tables(connection: psycopg.Connection) -> None:
     connection.execute(
         "ALTER TABLE agent_approval_requests ADD COLUMN IF NOT EXISTS context JSONB NOT NULL DEFAULT '{}'::jsonb"
     )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS agent_planning_state (
+            id SMALLINT PRIMARY KEY,
+            generation BIGINT NOT NULL CHECK (generation > 0),
+            updated_at TIMESTAMPTZ NOT NULL,
+            updated_by TEXT NOT NULL,
+            reset_reason TEXT NOT NULL
+        )
+        """
+    )
+    connection.execute(
+        """
+        INSERT INTO agent_planning_state
+            (id, generation, updated_at, updated_by, reset_reason)
+        VALUES (%s, 1, %s, %s, %s)
+        ON CONFLICT (id) DO NOTHING
+        """,
+        (PLANNING_STATE_ID, datetime.now(timezone.utc), "aicorp-governance", "initial planning generation"),
+    )
+    init_notification_tables(connection)
     connection.commit()
 
 
@@ -88,11 +119,13 @@ def record_audit_event(
     subject: str | None = None,
     details: dict[str, Any] | None = None,
 ) -> None:
-    connection.execute(
+    occurred_at = datetime.now(timezone.utc)
+    audit_event_id = connection.execute(
         """
         INSERT INTO agent_audit_events
             (agent_name, event_type, actor, subject, details, occurred_at)
         VALUES (%s, %s, %s, %s, %s::jsonb, %s)
+        RETURNING id
         """,
         (
             agent_name,
@@ -100,8 +133,20 @@ def record_audit_event(
             actor,
             subject,
             json.dumps(details or {}),
-            datetime.now(timezone.utc),
+            occurred_at,
         ),
+    ).fetchone()[0]
+    enqueue_audit_notification(
+        connection,
+        audit_event_id,
+        {
+            "agent_name": agent_name,
+            "event_type": event_type,
+            "actor": actor,
+            "subject": subject,
+            "details": details or {},
+            "occurred_at": occurred_at.isoformat(),
+        },
     )
 
 
@@ -155,6 +200,15 @@ def create_approval_request(
 ) -> int:
     if not action or not requested_by or not reason:
         raise ValueError("approval action, requester, and reason are required")
+    approval_context = dict(context or {})
+    if action in PLANNING_ACTIONS:
+        generation = connection.execute(
+            "SELECT generation FROM agent_planning_state WHERE id = %s",
+            (PLANNING_STATE_ID,),
+        ).fetchone()
+        if generation is None:
+            raise RuntimeError("planning state is unavailable")
+        approval_context.setdefault("planning_generation", int(generation[0]))
     row = connection.execute(
         """
         INSERT INTO agent_approval_requests
@@ -162,7 +216,7 @@ def create_approval_request(
         VALUES (%s, %s, %s, %s, %s::jsonb, %s)
         RETURNING id
         """,
-        (agent_name, action, requested_by, reason, json.dumps(context or {}), datetime.now(timezone.utc)),
+        (agent_name, action, requested_by, reason, json.dumps(approval_context), datetime.now(timezone.utc)),
     ).fetchone()
     connection.commit()
     return row[0]

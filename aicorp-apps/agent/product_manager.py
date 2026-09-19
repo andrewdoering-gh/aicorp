@@ -1,4 +1,6 @@
 import json
+import logging
+import os
 import urllib.request
 from typing import Any
 
@@ -7,9 +9,18 @@ PRODUCT_CONTEXT = """
 HomeLabOps is the first commercial product candidate built by AICorp. It targets
 technically capable homelab operators who run self-hosted services and need a
 clear way to understand service health, active alerts, and the next safe
-operational step. The current prototype is read-only and combines Prometheus
-health, active alerts, and an AICorp health-summary report. It must not expose
-secrets, execute arbitrary commands, or bypass human approval.
+operational step. The first delivery contract is intentionally concrete:
+GOAL-01 is centralized infrastructure visibility and is implemented by the Core
+Dashboard MVP, Device Discovery Agent, and Basic Alerting System. GOAL-02 is
+routine maintenance automation and GOAL-03 is common-service deployment
+simplification; those goals must remain visibly blocked until their own mapped
+requirements are implemented and accepted. The Core Dashboard MVP must load
+within two seconds, show discovered devices, and display last-known status. The
+Device Discovery Agent must detect standard home-server hardware and report
+discovery events to the dashboard. The Basic Alerting System must trigger on
+defined thresholds and deliver notifications through the configured channel.
+The product must not expose secrets, execute arbitrary commands, or bypass
+human approval.
 """.strip()
 
 BRIEF_REQUIRED_FIELDS = {
@@ -29,10 +40,18 @@ BACKLOG_REQUIRED_FIELDS = {
     "priority",
     "acceptance_criteria",
     "dependencies",
+    "goal_ids",
     "status",
 }
 VALID_PRIORITIES = {"now", "next", "later"}
 VALID_STATUSES = {"proposed", "ready", "in_progress", "blocked", "done"}
+GENERATION_TIMEOUT_SECONDS = max(90, int(os.environ.get("AICORP_GENERATION_TIMEOUT_SECONDS", "1800")))
+REASONING_MAX_TOKENS = max(16384, int(os.environ.get("AICORP_REASONING_MAX_TOKENS", "65536")))
+logger = logging.getLogger("aicorp-agent.product-manager")
+
+
+class GenerationBudgetExhaustedError(ValueError):
+    pass
 
 
 def _string_list(value: Any, field_name: str, maximum: int = 12) -> list[str]:
@@ -85,6 +104,7 @@ def validate_product_output(payload: Any) -> dict[str, Any]:
                 "dependencies": _string_list(dependencies, "dependencies", maximum=8)
                 if dependencies
                 else [],
+                "goal_ids": _string_list(item["goal_ids"], "goal_ids", maximum=8),
                 "status": item["status"],
             }
         )
@@ -104,38 +124,102 @@ def generate_product_output(
         "been validated. Return JSON only, with exactly the requested schema. "
         "Keep the first backlog small enough for a prototype.\n\n"
         f"Product context:\n{context}\n\n"
+        "Use GOAL-01, GOAL-02, and GOAL-03 in each backlog item's goal_ids. "
+        "Every Product Brief goal must have at least one mapped backlog item; do not map a requirement to a goal it does not implement.\n\n"
         "Required JSON schema:\n"
         '{"brief":{"title":"string","problem":"string","target_users":["string"],'
         '"goals":["string"],"non_goals":["string"],"assumptions":["string"],'
         '"constraints":["string"],"success_metrics":["string"]},'
         '"backlog":[{"id":"string","title":"string","description":"string",'
         '"priority":"now|next|later","acceptance_criteria":["string"],'
-        '"dependencies":["string"],"status":"proposed|ready|in_progress|blocked|done"}]}'
+        '"dependencies":["string"],"goal_ids":["GOAL-01"],'
+        '"status":"proposed|ready|in_progress|blocked|done"}]}'
     )
-    request = urllib.request.Request(
-        f"{base_url.rstrip('/')}/v1/chat/completions",
-        data=json.dumps(
-            {
-                "model": model,
-                "messages": [
-                    {
-                        "role": "system",
-                        "content": "You are a careful product manager. Output valid JSON only.",
-                    },
-                    {"role": "user", "content": prompt},
-                ],
-                **({} if model == "gpt-5.6-luna" else {"temperature": 0.2}),
+    generation_options = (
+        {
+            "temperature": 0.2,
+            "max_tokens": REASONING_MAX_TOKENS,
+            "think": True,
+            "extra_body": {
+                "think": True,
+                "chat_template_kwargs": {"enable_thinking": True},
+            },
+            "response_format": {"type": "json_object"},
+        }
+        if model != "gpt-5.6-luna"
+        else {}
+    )
+    last_error: Exception | None = None
+    for attempt in range(3):
+        retry_prompt = prompt
+        if last_error is not None:
+            retry_prompt += (
+                "\n\nYour previous response failed validation with this error: "
+                f"{last_error}. Return a complete replacement JSON object. "
+                "Every required list, including target_users, goals, non_goals, "
+                "assumptions, constraints, success_metrics, and acceptance_criteria, "
+                "must contain at least one non-empty string. Every backlog item must also include a non-empty "
+                "goal_ids list using GOAL-01, GOAL-02, or GOAL-03. Do not omit or rename fields."
+            )
+        request = urllib.request.Request(
+            f"{base_url.rstrip('/')}/v1/chat/completions",
+            data=json.dumps(
+                {
+                    "model": model,
+                    "messages": [
+                        {
+                            "role": "system",
+                            "content": "You are a careful product manager. Output valid JSON only.",
+                        },
+                        {"role": "user", "content": retry_prompt},
+                    ],
+                    **generation_options,
+                }
+            ).encode("utf-8"),
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=GENERATION_TIMEOUT_SECONDS) as response:
+                body = json.load(response)
+            message = body["choices"][0]["message"]
+            content = message.get("content") or ""
+            if not isinstance(content, str):
+                raise ValueError("model response content must be a string")
+            content = content.strip()
+            response_shape = {
+                "finish_reason": body.get("choices", [{}])[0].get("finish_reason"),
+                "message_keys": sorted(message),
+                "content_length": len(content),
+                "reasoning_length": len(message.get("reasoning_content") or message.get("reasoning") or ""),
             }
-        ).encode("utf-8"),
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        },
-        method="POST",
-    )
-    with urllib.request.urlopen(request, timeout=90) as response:
-        body = json.load(response)
-    content = body["choices"][0]["message"]["content"].strip()
-    if content.startswith("```"):
-        content = content.split("\n", 1)[1].rsplit("```", 1)[0].strip()
-    return validate_product_output(json.loads(content))
+            if response_shape["finish_reason"] == "length":
+                logger.error("model exhausted its output budget; not retrying response_shape=%s", response_shape)
+                raise GenerationBudgetExhaustedError(
+                    f"model exhausted its output budget: {response_shape}"
+                )
+            if "</think>" in content:
+                content = content.rsplit("</think>", 1)[1].strip()
+            if content.startswith("```"):
+                content = content.split("\n", 1)[1].rsplit("```", 1)[0].strip()
+            if not content:
+                raise ValueError("model returned empty final content")
+            try:
+                parsed = json.loads(content)
+            except json.JSONDecodeError as error:
+                start = content.find("{")
+                if start < 0:
+                    raise ValueError("model response did not contain a JSON object") from error
+                try:
+                    parsed, _ = json.JSONDecoder().raw_decode(content[start:])
+                except json.JSONDecodeError as decode_error:
+                    raise ValueError("model response contained malformed JSON") from decode_error
+            return validate_product_output(parsed)
+        except GenerationBudgetExhaustedError:
+            raise
+        except (KeyError, IndexError, TypeError, ValueError) as error:
+            last_error = error
+    raise ValueError(f"product brief generation failed after correction attempts: {last_error}") from last_error

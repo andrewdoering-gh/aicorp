@@ -18,7 +18,12 @@ COPY homelabops.html .
 COPY product_manager.py .
 COPY cto.py .
 COPY workers.py .
+COPY workstreams.py .
 COPY execution.py .
+COPY requirements.py .
+COPY product.py .
+COPY acceptance.py .
+COPY notifications.py .
 
 USER 65534:65534
 ENTRYPOINT ["python", "/app/agent.py"]

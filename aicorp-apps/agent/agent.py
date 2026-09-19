@@ -1,5 +1,6 @@
 import json
 import hmac
+import difflib
 import logging
 import os
 import re
@@ -13,6 +14,7 @@ import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from datetime import datetime, timezone
+from typing import Any, TypedDict
 from urllib.parse import urlsplit
 
 import psycopg
@@ -20,19 +22,51 @@ import psycopg
 from governance import (
     AUTO_DISPATCH_ACTIONS,
     AUTOMATED_HANDOFF_ACTIONS,
-    approved_action,
+    approved_action as ledger_approved_action,
     create_approval_request,
     decide_approval,
+    DEPLOYMENT_RETRY_ACTION,
     expire_pending_approvals,
     agent_can_approve_generation,
     get_approval_request,
     init_governance_tables,
+    PLANNING_ACTIONS,
+    PLANNING_STATE_ID,
     record_audit_event,
 )
 from product_manager import PRODUCT_CONTEXT, generate_product_output
 from cto import generate_technical_plan
-from workers import _generate, generate_engineering_plan, generate_worker_plan
+from workers import (
+    GENERATION_TIMEOUT_SECONDS,
+    PROPOSAL_MAX_TOKENS,
+    REASONING_MAX_TOKENS,
+    GenerationBudgetExhaustedError,
+    _generate,
+    generate_engineering_plan,
+    generate_worker_plan,
+)
 from execution import validate_change_proposal, validate_implementation_submission, validate_qa_result
+from notifications import run_notification_worker
+from product import (
+    alert_snapshot,
+    device_snapshot,
+    discovery_event_count,
+    ensure_local_device,
+    evaluate_alerts,
+    init_product_tables,
+    notification_snapshot,
+    record_discovery_event,
+)
+from requirements import (
+    acceptance_checks,
+    acceptance_evidence_passed,
+    apply_acceptance_evidence,
+    build_requirement_contract,
+    attach_requirement_contract,
+    require_complete_requirement_contract,
+    validate_requirement_contract,
+)
+from workstreams import WORKSTREAM_FILE_GROUPS, WORKSTREAM_ORDER, WORKSTREAM_PREDECESSORS
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("aicorp-agent")
@@ -46,7 +80,7 @@ QDRANT_URL = os.environ.get("QDRANT_URL", "http://qdrant:6333")
 OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "").rstrip("/")
 EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", "nomic-embed-text")
 KNOWLEDGE_COLLECTION = os.environ.get("KNOWLEDGE_COLLECTION", "aicorp-knowledge")
-MODEL_NAME = os.environ.get("AGENT_MODEL", "gpt-4o-mini")
+MODEL_NAME = os.environ.get("AGENT_MODEL", "local-qwen3.5-9b")
 PRODUCT_MANAGER_NAME = os.environ.get("PRODUCT_MANAGER_NAME", "aicorp-product-manager")
 PRODUCT_MANAGER_MODEL = os.environ.get("PRODUCT_MANAGER_MODEL", MODEL_NAME)
 CTO_NAME = os.environ.get("CTO_NAME", "aicorp-cto")
@@ -73,8 +107,191 @@ QA_VALIDATION_AGENT_NAME = os.environ.get("QA_VALIDATION_AGENT_NAME", "aicorp-qa
 EXECUTION_WORKER_INTERVAL_SECONDS = int(os.environ.get("EXECUTION_WORKER_INTERVAL_SECONDS", "30"))
 AUTOMATIC_HANDOFF_MAX_ATTEMPTS = max(1, int(os.environ.get("AUTOMATIC_HANDOFF_MAX_ATTEMPTS", "3")))
 AUTOMATIC_HANDOFF_RETRY_DELAY_SECONDS = max(0, int(os.environ.get("AUTOMATIC_HANDOFF_RETRY_DELAY_SECONDS", "5")))
+AUTOMATIC_DISPATCH_TIMEOUT_SECONDS = max(120, int(os.environ.get("AUTOMATIC_DISPATCH_TIMEOUT_SECONDS", "1860")))
+MAX_DEPLOYMENT_ATTEMPTS = max(1, int(os.environ.get("AICORP_MAX_DEPLOYMENT_ATTEMPTS", "3")))
+PLANNING_RESET_CONFIRMATION = "RESET_PLANNING_WORKSPACE"
 
 
+class PlanningResetConflict(RuntimeError):
+    """Raised when a planning generation changed during an operation."""
+
+
+class DeploymentRetryConflict(RuntimeError):
+    """Raised when a failed deployment cannot be retried in its current state."""
+
+
+class DeploymentRemediationConflict(RuntimeError):
+    """Raised when a failed deployment cannot enter automatic remediation."""
+
+
+class ExecutionConfigurationError(RuntimeError):
+    """Raised when an approved execution task cannot run deterministically."""
+
+
+class PlanningResetScope(TypedDict):
+    planning_generation: int
+    next_planning_generation: int
+    active_product_brief_ids: list[int]
+    technical_plan_ids: list[int]
+    engineering_plan_ids: list[int]
+    worker_plan_ids: list[int]
+    execution_task_ids: list[int]
+    change_proposal_ids: list[int]
+    approval_ids: list[int]
+    cancelable_approval_ids: list[int]
+    running_deployment_ids: list[int]
+    completed_deployment_approval_ids: list[int]
+    deployment_approval_ids: list[int]
+
+
+def current_planning_generation(connection: psycopg.Connection, lock: bool = False) -> int:
+    """Return the singleton planning generation, optionally locking its row."""
+    connection.execute(
+        """
+        INSERT INTO agent_planning_state (id, generation, updated_at, updated_by, reset_reason)
+        VALUES (%s, 1, %s, %s, %s)
+        ON CONFLICT (id) DO NOTHING
+        """,
+        (PLANNING_STATE_ID, datetime.now(timezone.utc), AGENT_NAME, "initial planning generation"),
+    )
+    query = "SELECT generation FROM agent_planning_state WHERE id = %s"
+    if lock:
+        query += " FOR UPDATE"
+    row = connection.execute(query, (PLANNING_STATE_ID,)).fetchone()
+    if row is None:
+        raise RuntimeError("planning state is unavailable")
+    return int(row[0])
+
+
+def add_planning_generation(
+    connection: psycopg.Connection,
+    action: str,
+    context: dict[str, object] | None,
+) -> dict[str, object]:
+    """Stamp planning approvals so a later reset can invalidate stale work."""
+    enriched = dict(context or {})
+    if action in PLANNING_ACTIONS and "planning_generation" not in enriched:
+        enriched["planning_generation"] = current_planning_generation(connection)
+    return enriched
+
+
+def planning_generation_matches(
+    connection: psycopg.Connection,
+    context: dict[str, object] | None,
+    generation: int | None = None,
+) -> bool:
+    current = generation if generation is not None else current_planning_generation(connection)
+    value = (context or {}).get("planning_generation")
+    if value is None:
+        return current == 1
+    try:
+        return int(str(value)) == current
+    except (TypeError, ValueError):
+        return False
+
+
+def planning_reset_confirmed(payload: dict[str, object]) -> bool:
+    """Require the explicit boolean or phrase used by the reset approval gate."""
+    return (
+        payload.get("confirm") is True
+        or str(payload.get("confirmation", "")).strip() == PLANNING_RESET_CONFIRMATION
+    )
+
+
+def require_current_planning_approval(
+    connection: psycopg.Connection,
+    approval_id: int,
+    action: str,
+    lock_state: bool = False,
+) -> tuple:
+    """Require an approved approval request from the current planning generation."""
+    generation = current_planning_generation(connection, lock=lock_state)
+    row = get_approval_request(connection, approval_id)
+    if row is None or row[2] != action or row[5] != "approved":
+        raise PlanningResetConflict("approval is missing, not approved, or belongs to another action")
+    if action in PLANNING_ACTIONS and not planning_generation_matches(connection, row[10], generation):
+        raise PlanningResetConflict("planning reset invalidated this approval request")
+    return row
+
+
+def approved_current_action(connection: psycopg.Connection, approval_id: int, action: str) -> bool:
+    """Check approval status and reject approvals from an obsolete planning generation."""
+    if not ledger_approved_action(connection, approval_id, action):
+        return False
+    try:
+        require_current_planning_approval(connection, approval_id, action)
+    except PlanningResetConflict:
+        return False
+    return True
+
+
+def approved_action(connection: psycopg.Connection, approval_id: int, action: str) -> bool:
+    """Check an approval and reject planning actions from an obsolete generation."""
+    return approved_current_action(connection, approval_id, action)
+
+
+def load_requirement_contract(connection: psycopg.Connection, brief_id: int) -> dict[str, object]:
+    row = connection.execute(
+        "SELECT brief, backlog, requirements FROM agent_product_briefs WHERE id = %s",
+        (brief_id,),
+    ).fetchone()
+    if row is None:
+        raise ValueError("product brief not found")
+    brief, backlog, stored = row
+    try:
+        contract = validate_requirement_contract(stored, brief_id)
+    except ValueError:
+        contract = build_requirement_contract(brief_id, brief, backlog)
+        connection.execute(
+            "UPDATE agent_product_briefs SET requirements = %s::jsonb, updated_at = %s WHERE id = %s",
+            (json.dumps(contract), datetime.now(timezone.utc), brief_id),
+        )
+    return contract
+
+
+def update_product_requirement_statuses(
+    connection: psycopg.Connection,
+    brief_id: int,
+    evidence: list[dict[str, object]],
+) -> dict[str, object]:
+    contract = load_requirement_contract(connection, brief_id)
+    updated_contract = apply_acceptance_evidence(contract, evidence)
+    backlog = connection.execute(
+        "SELECT backlog FROM agent_product_briefs WHERE id = %s",
+        (brief_id,),
+    ).fetchone()[0]
+    status_by_source_id = {
+        item["source_id"]: item["status"]
+        for item in updated_contract["items"]
+    }
+    updated_backlog = [
+        {**item, "status": status_by_source_id.get(str(item.get("id")), item.get("status"))}
+        for item in backlog
+    ]
+    connection.execute(
+        """
+        UPDATE agent_product_briefs
+        SET requirements = %s::jsonb, backlog = %s::jsonb, updated_at = %s
+        WHERE id = %s
+        """,
+        (json.dumps(updated_contract), json.dumps(updated_backlog), datetime.now(timezone.utc), brief_id),
+    )
+    return updated_contract
+
+
+def sync_product_state(connection: psycopg.Connection) -> list[dict[str, object]]:
+    ensure_local_device(connection)
+    transitions = evaluate_alerts(connection)
+    for transition in transitions:
+        record_audit_event(
+            connection,
+            AGENT_NAME,
+            f"product_alert_{transition['state']}",
+            AGENT_NAME,
+            str(transition["device_id"]),
+            transition,
+        )
+    return transitions
 def require_config() -> None:
     missing = [
         name
@@ -86,6 +303,14 @@ def require_config() -> None:
     ]
     if missing:
         raise RuntimeError("missing required agent configuration: " + ", ".join(missing))
+
+
+def native_ollama_base_url(base_url: str) -> str:
+    parsed = urlsplit(base_url.rstrip("/"))
+    path = parsed.path.rstrip("/")
+    if path.lower().endswith("/v1"):
+        path = path[:-3]
+    return parsed._replace(path=path).geturl().rstrip("/")
 
 
 def dispatch_error_details(error: Exception) -> dict[str, object]:
@@ -101,19 +326,27 @@ def dispatch_error_details(error: Exception) -> dict[str, object]:
 
 
 def retryable_dispatch_error(error: Exception) -> bool:
-    return isinstance(error, (urllib.error.URLError, TimeoutError)) or (
-        isinstance(error, urllib.error.HTTPError) and error.code in {408, 429, 500, 502, 503, 504}
-    )
+    if isinstance(error, urllib.error.HTTPError):
+        return error.code in {408, 429, 500, 502, 503, 504}
+    return isinstance(error, (urllib.error.URLError, TimeoutError))
 
 
-def record_dispatch_failure(action: str, approval_id: int, attempt: int, error: Exception, exhausted: bool) -> None:
+def record_dispatch_failure(
+    action: str,
+    approval_id: int,
+    attempt: int,
+    error: Exception,
+    exhausted: bool,
+    details: dict[str, object] | None = None,
+) -> None:
+    error_details = details or dispatch_error_details(error)
     details = {
         "action": action,
         "attempt": attempt,
         "max_attempts": AUTOMATIC_HANDOFF_MAX_ATTEMPTS,
         "retryable": retryable_dispatch_error(error),
         "exhausted": exhausted,
-        **dispatch_error_details(error),
+        **error_details,
     }
     with psycopg.connect(DATABASE_URL) as connection:
         record_audit_event(
@@ -139,6 +372,18 @@ def dispatch_approved_action(action: str, approval_id: int) -> None:
         if approval is None:
             raise RuntimeError("approval request not found")
         context = approval[10] or {}
+        with psycopg.connect(DATABASE_URL) as connection:
+            if not planning_generation_matches(connection, context):
+                record_audit_event(
+                    connection,
+                    AGENT_NAME,
+                    "approved_action_invalidated",
+                    AGENT_NAME,
+                    str(approval_id),
+                    {"action": action, "reason": "planning_generation_reset"},
+                )
+                connection.commit()
+                return
         payload: dict[str, object] = {"approval_id": approval_id}
         if action == "generate_product_brief":
             path = "/product-briefs/generate"
@@ -168,28 +413,46 @@ def dispatch_approved_action(action: str, approval_id: int) -> None:
                 "role": role,
                 "requested_by": SOFTWARE_ENGINEER_NAME if role == "software_engineer" else QA_ENGINEER_NAME,
             })
-        request = urllib.request.Request(
-            f"http://127.0.0.1:{AGENT_HTTP_PORT}{path}",
-            data=json.dumps(payload).encode("utf-8"),
-            headers={"Authorization": f"Bearer {AGENT_APPROVAL_TOKEN}", "Content-Type": "application/json"},
-            method="POST",
-        )
+        request_body = json.dumps(payload).encode("utf-8")
         for attempt in range(1, AUTOMATIC_HANDOFF_MAX_ATTEMPTS + 1):
             try:
-                with urllib.request.urlopen(request, timeout=120) as response:
+                request = urllib.request.Request(
+                    f"http://127.0.0.1:{AGENT_HTTP_PORT}{path}",
+                    data=request_body,
+                    headers={
+                        "Authorization": f"Bearer {AGENT_APPROVAL_TOKEN}",
+                        "Content-Type": "application/json",
+                        "Content-Length": str(len(request_body)),
+                    },
+                    method="POST",
+                )
+                with urllib.request.urlopen(request, timeout=AUTOMATIC_DISPATCH_TIMEOUT_SECONDS) as response:
                     response.read()
                 logger.info("dispatched approved action=%s approval_id=%s attempt=%s", action, approval_id, attempt)
                 return
             except Exception as error:
                 exhausted = attempt >= AUTOMATIC_HANDOFF_MAX_ATTEMPTS or not retryable_dispatch_error(error)
-                record_dispatch_failure(action, approval_id, attempt, error, exhausted)
-                logger.exception("approved action dispatch failed: action=%s approval_id=%s attempt=%s", action, approval_id, attempt)
+                details = dispatch_error_details(error)
+                record_dispatch_failure(action, approval_id, attempt, error, exhausted, details)
+                logger.exception(
+                    "approved action dispatch failed: action=%s approval_id=%s attempt=%s details=%s",
+                    action,
+                    approval_id,
+                    attempt,
+                    details,
+                )
                 if exhausted:
                     return
                 time.sleep(AUTOMATIC_HANDOFF_RETRY_DELAY_SECONDS * attempt)
     except Exception as error:
-        record_dispatch_failure(action, approval_id, 1, error, True)
-        logger.exception("approved action dispatch setup failed: action=%s approval_id=%s", action, approval_id)
+        details = dispatch_error_details(error)
+        record_dispatch_failure(action, approval_id, 1, error, True, details)
+        logger.exception(
+            "approved action dispatch setup failed: action=%s approval_id=%s details=%s",
+            action,
+            approval_id,
+            details,
+        )
 
 
 def auto_approve_handoff(action: str, requested_by: str, reason: str, context: dict) -> int:
@@ -197,7 +460,7 @@ def auto_approve_handoff(action: str, requested_by: str, reason: str, context: d
     if action not in AUTOMATED_HANDOFF_ACTIONS:
         raise ValueError(f"action is not eligible for automatic approval: {action}")
     with psycopg.connect(DATABASE_URL) as connection:
-        init_governance_tables(connection)
+        context = add_planning_generation(connection, action, context)
         existing = connection.execute(
             """
             SELECT id FROM agent_approval_requests
@@ -248,6 +511,7 @@ def dispatch_automated_handoff(action: str, approval_id: int, context: dict) -> 
         },
         method="POST",
     )
+    result: dict[str, Any] = {}
     for attempt in range(1, AUTOMATIC_HANDOFF_MAX_ATTEMPTS + 1):
         try:
             with urllib.request.urlopen(request, timeout=120) as response:
@@ -255,8 +519,15 @@ def dispatch_automated_handoff(action: str, approval_id: int, context: dict) -> 
             break
         except Exception as error:
             exhausted = attempt >= AUTOMATIC_HANDOFF_MAX_ATTEMPTS or not retryable_dispatch_error(error)
-            record_dispatch_failure(action, approval_id, attempt, error, exhausted)
-            logger.exception("automated handoff failed: action=%s approval_id=%s attempt=%s", action, approval_id, attempt)
+            details = dispatch_error_details(error)
+            record_dispatch_failure(action, approval_id, attempt, error, exhausted, details)
+            logger.exception(
+                "automated handoff failed: action=%s approval_id=%s attempt=%s details=%s",
+                action,
+                approval_id,
+                attempt,
+                details,
+            )
             if exhausted:
                 return
             time.sleep(AUTOMATIC_HANDOFF_RETRY_DELAY_SECONDS * attempt)
@@ -271,7 +542,22 @@ def dispatch_automated_handoff(action: str, approval_id: int, context: dict) -> 
 
 def approve_repository_change_automatically(proposal_id: int) -> None:
     """Approve a QA-passed proposal and create its sole human deployment gate."""
+    remediation_source_approval_id: int | None = None
     with psycopg.connect(DATABASE_URL) as connection:
+        remediation = connection.execute(
+            """
+            SELECT approval.context
+            FROM agent_change_proposals AS proposal
+            JOIN agent_execution_tasks AS task ON task.id = proposal.execution_task_id
+            JOIN agent_approval_requests AS approval ON approval.id = task.start_approval_id
+            WHERE proposal.id = %s
+            """,
+            (proposal_id,),
+        ).fetchone()
+        if remediation and isinstance(remediation[0], dict):
+            source_approval = remediation[0].get("deployment_remediation_for_approval_id")
+            if source_approval is not None:
+                remediation_source_approval_id = int(source_approval)
         updated = connection.execute(
             """
             UPDATE agent_change_proposals
@@ -291,13 +577,23 @@ def approve_repository_change_automatically(proposal_id: int) -> None:
             str(proposal_id),
             {"automated": True},
         )
-        connection.commit()
-    create_pending_approval(
-        "deploy",
-        QA_ENGINEER_NAME,
-        f"Final deployment approval for QA-approved repository proposal {proposal_id}.",
-        {"proposal_id": proposal_id},
-    )
+        if remediation_source_approval_id is not None:
+            create_deployment_retry_approval(
+                connection,
+                QA_ENGINEER_NAME,
+                remediation_source_approval_id,
+                f"Review the corrected proposal {proposal_id} and approve a retry of failed deployment {remediation_source_approval_id}.",
+                replacement_proposal_id=proposal_id,
+            )
+        else:
+            connection.commit()
+    if remediation_source_approval_id is None:
+        create_pending_approval(
+            "deploy",
+            QA_ENGINEER_NAME,
+            f"Final deployment approval for QA-approved repository proposal {proposal_id}.",
+            {"proposal_id": proposal_id},
+        )
 
 
 def queue_automated_handoff(action: str, requested_by: str, context: dict) -> None:
@@ -315,12 +611,12 @@ def queue_automated_handoff(action: str, requested_by: str, context: dict) -> No
     ).start()
 
 
-def queue_generation_approval(action: str, requested_by: str, context: dict) -> None:
+def queue_generation_approval(action: str, requested_by: str, context: dict) -> int:
     """Create and approve the next non-human artifact-generation transition."""
     if action not in AUTO_DISPATCH_ACTIONS:
         raise ValueError(f"action is not eligible for automatic generation: {action}")
     with psycopg.connect(DATABASE_URL) as connection:
-        init_governance_tables(connection)
+        context = add_planning_generation(connection, action, context)
         existing = connection.execute(
             """
             SELECT id, status FROM agent_approval_requests
@@ -332,7 +628,7 @@ def queue_generation_approval(action: str, requested_by: str, context: dict) -> 
         if existing:
             request_id = int(existing[0])
             if existing[1] == "approved":
-                return
+                return request_id
         else:
             request_id = create_approval_request(
                 connection, AGENT_NAME, action, requested_by,
@@ -352,12 +648,13 @@ def queue_generation_approval(action: str, requested_by: str, context: dict) -> 
         args=(action, request_id),
         daemon=True,
     ).start()
+    return request_id
 
 
 def create_pending_approval(action: str, requested_by: str, reason: str, context: dict) -> int:
     """Create one pending approval for a human-controlled workflow boundary."""
     with psycopg.connect(DATABASE_URL) as connection:
-        init_governance_tables(connection)
+        context = add_planning_generation(connection, action, context)
         existing = connection.execute(
             """
             SELECT id FROM agent_approval_requests
@@ -377,6 +674,654 @@ def create_pending_approval(action: str, requested_by: str, reason: str, context
         )
         connection.commit()
     return request_id
+
+
+def deployment_failure_context(evidence: object) -> dict[str, object]:
+    if not isinstance(evidence, dict):
+        return {"message": "deployment failed without structured evidence"}
+    context: dict[str, object] = {}
+    for key in ("error", "message", "result", "completion_blocked"):
+        value = evidence.get(key)
+        if isinstance(value, str) and value.strip():
+            context[key] = value.strip()[:500]
+    acceptance = evidence.get("acceptance")
+    if isinstance(acceptance, dict):
+        failures = []
+        for item in acceptance.get("evidence", []):
+            if not isinstance(item, dict) or item.get("result") == "passed":
+                continue
+            failure = {
+                key: item[key]
+                for key in (
+                    "acceptance_criterion_id",
+                    "requirement_id",
+                    "result",
+                    "command",
+                    "expected",
+                    "actual",
+                )
+                if key in item and isinstance(item[key], (str, int, float, bool))
+            }
+            if failure:
+                failures.append(failure)
+        if failures:
+            context["acceptance_failures"] = failures[:32]
+    return context
+
+
+def queue_deployment_remediation(source_approval_id: int, source_proposal_id: int) -> dict[str, object]:
+    with psycopg.connect(DATABASE_URL) as connection:
+        source = connection.execute(
+            """
+            SELECT source_approval.action, source_approval.status, source_approval.context,
+                   source_run.proposal_id, source_run.status, source_run.evidence,
+                   proposal.status, brief.status, task.work_item_id, worker.id,
+                   worker.role, engineering.id, technical.product_brief_id
+            FROM agent_deployment_runs AS source_run
+            JOIN agent_approval_requests AS source_approval
+                ON source_approval.id = source_run.approval_id
+            JOIN agent_change_proposals AS proposal
+                ON proposal.id = source_run.proposal_id
+            JOIN agent_execution_tasks AS task
+                ON task.id = proposal.execution_task_id
+            JOIN agent_worker_plans AS worker
+                ON worker.id = task.worker_plan_id
+            JOIN agent_engineering_plans AS engineering
+                ON engineering.id = worker.engineering_plan_id
+            JOIN agent_technical_plans AS technical
+                ON technical.id = engineering.technical_plan_id
+            JOIN agent_product_briefs AS brief
+                ON brief.id = technical.product_brief_id
+            WHERE source_run.approval_id = %s
+            FOR UPDATE OF source_run, source_approval, proposal
+            """,
+            (source_approval_id,),
+        ).fetchone()
+    if source is None:
+        raise DeploymentRemediationConflict("deployment run not found")
+    (
+        source_action,
+        source_status,
+        source_context,
+        persisted_proposal_id,
+        run_status,
+        evidence,
+        proposal_status,
+        brief_status,
+        work_item_id,
+        worker_plan_id,
+        worker_role,
+        engineering_plan_id,
+        product_brief_id,
+    ) = source
+    if int(persisted_proposal_id) != int(source_proposal_id):
+        raise DeploymentRemediationConflict("deployment proposal does not match the failed run")
+    if source_action not in {"deploy", DEPLOYMENT_RETRY_ACTION}:
+        raise DeploymentRemediationConflict("only deployment runs can enter automatic remediation")
+    if source_status != "approved" or run_status != "failed":
+        raise DeploymentRemediationConflict("only an approved failed deployment can enter automatic remediation")
+    if proposal_status != "approved":
+        raise DeploymentRemediationConflict("the failed deployment proposal is no longer approved")
+    if brief_status == "archived":
+        raise DeploymentRemediationConflict("the Product Brief is archived")
+    if worker_role != "software_engineer":
+        raise DeploymentRemediationConflict(f"no automatic remediation route exists for worker role {worker_role}")
+    with psycopg.connect(DATABASE_URL) as connection:
+        if not planning_generation_matches(connection, source_context if isinstance(source_context, dict) else {}):
+            raise DeploymentRemediationConflict("planning reset invalidated this deployment")
+        generation = source_context.get("planning_generation") if isinstance(source_context, dict) else None
+        failed_attempt_query = """
+            SELECT count(*)
+            FROM agent_deployment_runs AS failed_run
+            JOIN agent_change_proposals AS failed_proposal
+                ON failed_proposal.id = failed_run.proposal_id
+            JOIN agent_execution_tasks AS failed_task
+                ON failed_task.id = failed_proposal.execution_task_id
+            JOIN agent_approval_requests AS failed_approval
+                ON failed_approval.id = failed_run.approval_id
+            WHERE failed_run.status = 'failed'
+              AND failed_task.worker_plan_id = %s
+              AND failed_task.work_item_id = %s
+        """
+        parameters: tuple[object, ...] = (int(worker_plan_id), str(work_item_id))
+        if generation is not None:
+            failed_attempt_query += " AND failed_approval.context->>'planning_generation' = %s"
+            parameters += (str(generation),)
+        failed_attempts = int(connection.execute(failed_attempt_query, parameters).fetchone()[0])
+        if failed_attempts >= MAX_DEPLOYMENT_ATTEMPTS:
+            already_recorded = connection.execute(
+                """
+                SELECT 1
+                FROM agent_audit_events
+                WHERE event_type = 'deployment_remediation_exhausted'
+                  AND subject = %s
+                LIMIT 1
+                """,
+                (str(source_approval_id),),
+            ).fetchone()
+            if already_recorded is None:
+                record_audit_event(
+                    connection,
+                    EXECUTION_AGENT_NAME,
+                    "deployment_remediation_exhausted",
+                    SOFTWARE_ENGINEER_NAME,
+                    str(source_approval_id),
+                    {
+                        "source_proposal_id": int(source_proposal_id),
+                        "work_item_id": str(work_item_id),
+                        "worker_plan_id": int(worker_plan_id),
+                        "failed_attempts": failed_attempts,
+                        "max_deployment_attempts": MAX_DEPLOYMENT_ATTEMPTS,
+                        "failure": deployment_failure_context(evidence),
+                    },
+                )
+            connection.execute(
+                """
+                UPDATE agent_deployment_runs
+                SET evidence = COALESCE(evidence, '{}'::jsonb) || %s::jsonb
+                WHERE approval_id = %s
+                """,
+                (
+                    json.dumps(
+                        {
+                            "deployment_remediation_exhausted": True,
+                            "failed_attempts": failed_attempts,
+                            "max_deployment_attempts": MAX_DEPLOYMENT_ATTEMPTS,
+                        }
+                    ),
+                    int(source_approval_id),
+                ),
+            )
+            connection.commit()
+            return {
+                "status": "exhausted",
+                "source_deployment_approval_id": int(source_approval_id),
+                "source_proposal_id": int(source_proposal_id),
+                "work_item_id": str(work_item_id),
+                "failed_attempts": failed_attempts,
+                "max_deployment_attempts": MAX_DEPLOYMENT_ATTEMPTS,
+                "next_step": "Stop automatic retries and correct the acceptance or deployment boundary before starting a new governed planning generation.",
+            }
+    failure_context = deployment_failure_context(evidence)
+    context = {
+        "worker_plan_id": int(worker_plan_id),
+        "work_item_id": str(work_item_id),
+        "engineering_plan_id": int(engineering_plan_id),
+        "deployment_remediation_for_approval_id": int(source_approval_id),
+        "deployment_remediation_for_proposal_id": int(source_proposal_id),
+        "product_brief_id": int(product_brief_id),
+        "responsible_agent": SOFTWARE_ENGINEER_NAME,
+        "responsible_role": worker_role,
+        "deployment_failure": failure_context,
+    }
+    with psycopg.connect(DATABASE_URL) as connection:
+        existing = connection.execute(
+            """
+            SELECT id
+            FROM agent_approval_requests
+            WHERE action = 'start_software_engineer_execution'
+              AND status IN ('pending', 'approved')
+              AND context->>'deployment_remediation_for_approval_id' = %s
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (str(source_approval_id),),
+        ).fetchone()
+    approval_id = int(existing[0]) if existing else auto_approve_handoff(
+        "start_software_engineer_execution",
+        SOFTWARE_ENGINEER_NAME,
+        f"Automatically remediate failed deployment approval {source_approval_id} for work item {work_item_id}.",
+        context,
+    )
+    task_id = start_automated_execution(approval_id, SOFTWARE_ENGINEER_NAME, context)
+    with psycopg.connect(DATABASE_URL) as connection:
+        record_audit_event(
+            connection,
+            EXECUTION_AGENT_NAME,
+            "deployment_remediation_queued",
+            SOFTWARE_ENGINEER_NAME,
+            str(source_approval_id),
+            {
+                "source_proposal_id": int(source_proposal_id),
+                "execution_task_id": int(task_id),
+                "execution_approval_id": int(approval_id),
+                "responsible_agent": SOFTWARE_ENGINEER_NAME,
+                "responsible_role": worker_role,
+                "work_item_id": str(work_item_id),
+            },
+        )
+        connection.commit()
+    return {
+        "status": "queued",
+        "source_deployment_approval_id": int(source_approval_id),
+        "source_proposal_id": int(source_proposal_id),
+        "execution_task_id": int(task_id),
+        "execution_approval_id": int(approval_id),
+        "responsible_agent": SOFTWARE_ENGINEER_NAME,
+        "responsible_role": worker_role,
+        "work_item_id": str(work_item_id),
+        "next_step": "The responsible agent will produce a replacement proposal; a validated retry is approved automatically after QA approves it.",
+    }
+
+
+def break_deployment_retry_loop(source_approval_id: int, actor: str, reason: str) -> dict[str, object]:
+    """Cancel unfinished remediation work linked to one failed deployment."""
+    if not actor.strip():
+        raise ValueError("retry-loop breaker actor is required")
+    if not reason.strip():
+        raise ValueError("retry-loop breaker reason is required")
+    with psycopg.connect(DATABASE_URL) as connection:
+        source = connection.execute(
+            """
+                 SELECT source_approval.status, source_run.status, source_run.proposal_id,
+                     source_approval.context, source_task.worker_plan_id, source_task.work_item_id
+            FROM agent_deployment_runs AS source_run
+            JOIN agent_approval_requests AS source_approval
+                ON source_approval.id = source_run.approval_id
+            JOIN agent_change_proposals AS source_proposal
+                ON source_proposal.id = source_run.proposal_id
+            JOIN agent_execution_tasks AS source_task
+                ON source_task.id = source_proposal.execution_task_id
+            WHERE source_run.approval_id = %s
+            FOR UPDATE OF source_run, source_approval
+            """,
+            (source_approval_id,),
+        ).fetchone()
+        if source is None:
+            raise DeploymentRemediationConflict("deployment run not found")
+        source_status, run_status, source_proposal_id, source_context, worker_plan_id, work_item_id = source
+        if run_status != "failed":
+            raise DeploymentRemediationConflict("only a failed deployment can have its retry loop broken")
+        if not planning_generation_matches(connection, source_context if isinstance(source_context, dict) else {}):
+            raise DeploymentRemediationConflict("planning reset invalidated this deployment")
+
+        remediation_rows = connection.execute(
+            """
+            SELECT remediation_approval.id, remediation_task.id
+            FROM agent_approval_requests AS remediation_approval
+            JOIN agent_execution_tasks AS remediation_task
+                ON remediation_task.start_approval_id = remediation_approval.id
+            WHERE remediation_approval.action = 'start_software_engineer_execution'
+              AND remediation_approval.status IN ('pending', 'approved')
+              AND remediation_approval.context->>'deployment_remediation_for_approval_id' = %s
+            FOR UPDATE OF remediation_approval, remediation_task
+            """,
+            (str(source_approval_id),),
+        ).fetchall()
+        remediation_approval_ids = [int(row[0]) for row in remediation_rows]
+        remediation_task_ids = [int(row[1]) for row in remediation_rows]
+        remediation_proposal_rows = connection.execute(
+            """
+            SELECT id
+            FROM agent_change_proposals
+            WHERE execution_task_id = ANY(%s)
+              AND status NOT IN ('completed', 'superseded')
+            FOR UPDATE
+            """,
+            (remediation_task_ids or [-1],),
+        ).fetchall()
+        remediation_proposal_ids = [int(row[0]) for row in remediation_proposal_rows]
+        deployment_rows = connection.execute(
+            """
+            SELECT approval.id, deployment.status
+            FROM agent_approval_requests AS approval
+            LEFT JOIN agent_deployment_runs AS deployment
+                ON deployment.approval_id = approval.id
+            WHERE approval.action IN ('deploy', 'retry_deployment')
+              AND approval.status IN ('pending', 'approved')
+              AND approval.context->>'proposal_id' = ANY(%s)
+            FOR UPDATE OF approval
+            """,
+            ([str(item) for item in remediation_proposal_ids] or ["-1"],),
+        ).fetchall()
+        if any(row[1] == "running" for row in deployment_rows):
+            raise DeploymentRemediationConflict("cannot break a retry loop while a replacement deployment is running")
+        deployment_approval_ids = [int(row[0]) for row in deployment_rows if row[1] != "completed"]
+        cancelled_approval_ids = []
+        if remediation_approval_ids or deployment_approval_ids:
+            cancelled_approval_ids = [
+                int(row[0])
+                for row in connection.execute(
+                    """
+                    UPDATE agent_approval_requests
+                    SET status = 'cancelled', decided_by = %s, decided_at = %s,
+                        decision_reason = %s
+                    WHERE id = ANY(%s) AND status IN ('pending', 'approved')
+                    RETURNING id
+                    """,
+                    (
+                        actor,
+                        datetime.now(timezone.utc),
+                        f"Deployment retry loop broken: {reason}",
+                        remediation_approval_ids + deployment_approval_ids,
+                    ),
+                ).fetchall()
+            ]
+        superseded_proposal_ids = [
+            int(row[0])
+            for row in connection.execute(
+                """
+                UPDATE agent_change_proposals
+                SET status = 'superseded', updated_at = %s
+                WHERE id = ANY(%s) AND status NOT IN ('completed', 'superseded')
+                RETURNING id
+                """,
+                (datetime.now(timezone.utc), remediation_proposal_ids or [-1]),
+            ).fetchall()
+        ]
+        superseded_task_ids = [
+            int(row[0])
+            for row in connection.execute(
+                """
+                UPDATE agent_execution_tasks
+                SET status = 'superseded', updated_at = %s
+                WHERE id = ANY(%s) AND status NOT IN ('completed', 'failed', 'superseded')
+                RETURNING id
+                """,
+                (datetime.now(timezone.utc), remediation_task_ids or [-1]),
+            ).fetchall()
+        ]
+        evidence_marker = {
+            "deployment_remediation_exhausted": True,
+            "deployment_remediation_break_reason": reason,
+            "deployment_remediation_broken_by": actor,
+            "cancelled_remediation_approval_count": len(cancelled_approval_ids),
+            "superseded_remediation_task_count": len(superseded_task_ids),
+            "superseded_remediation_proposal_count": len(superseded_proposal_ids),
+        }
+        connection.execute(
+            """
+            UPDATE agent_deployment_runs
+            SET evidence = COALESCE(evidence, '{}'::jsonb) || %s::jsonb
+            WHERE approval_id = %s
+            """,
+            (json.dumps(evidence_marker), int(source_approval_id)),
+        )
+        record_audit_event(
+            connection,
+            EXECUTION_AGENT_NAME,
+            "deployment_retry_loop_broken",
+            actor,
+            str(source_approval_id),
+            {
+                "source_proposal_id": int(source_proposal_id),
+                "worker_plan_id": int(worker_plan_id),
+                "work_item_id": str(work_item_id),
+                "reason": reason,
+                "cancelled_approval_ids": cancelled_approval_ids,
+                "superseded_task_ids": superseded_task_ids,
+                "superseded_proposal_ids": superseded_proposal_ids,
+            },
+        )
+        record_audit_event(
+            connection,
+            EXECUTION_AGENT_NAME,
+            "deployment_remediation_exhausted",
+            actor,
+            str(source_approval_id),
+            {
+                "source_proposal_id": int(source_proposal_id),
+                "worker_plan_id": int(worker_plan_id),
+                "work_item_id": str(work_item_id),
+                "reason": reason,
+                "manual_break": True,
+            },
+        )
+        connection.commit()
+    return {
+        "status": "broken",
+        "source_deployment_approval_id": int(source_approval_id),
+        "source_proposal_id": int(source_proposal_id),
+        "work_item_id": str(work_item_id),
+        "cancelled_approval_ids": cancelled_approval_ids,
+        "superseded_task_ids": superseded_task_ids,
+        "superseded_proposal_ids": superseded_proposal_ids,
+    }
+
+
+def create_deployment_retry_approval(
+    connection: psycopg.Connection,
+    actor: str,
+    source_approval_id: int,
+    reason: str,
+    replacement_proposal_id: int | None = None,
+) -> int:
+    """Create and automatically approve a retry for one terminal failed deployment."""
+    if not actor.strip():
+        raise ValueError("retry actor is required")
+    if not reason.strip():
+        raise ValueError("retry reason is required")
+    source = connection.execute(
+        """
+        SELECT source_approval.action, source_approval.status, source_approval.context,
+                     source_run.proposal_id, source_run.status,
+                     proposal.status, brief.status
+        FROM agent_deployment_runs AS source_run
+        JOIN agent_approval_requests AS source_approval
+            ON source_approval.id = source_run.approval_id
+        JOIN agent_change_proposals AS proposal
+            ON proposal.id = source_run.proposal_id
+        JOIN agent_execution_tasks AS task
+            ON task.id = proposal.execution_task_id
+        JOIN agent_worker_plans AS worker
+            ON worker.id = task.worker_plan_id
+        JOIN agent_engineering_plans AS engineering
+            ON engineering.id = worker.engineering_plan_id
+        JOIN agent_technical_plans AS technical
+            ON technical.id = engineering.technical_plan_id
+        JOIN agent_product_briefs AS brief
+            ON brief.id = technical.product_brief_id
+        WHERE source_run.approval_id = %s
+        FOR UPDATE OF source_run, source_approval, proposal
+        """,
+        (source_approval_id,),
+    ).fetchone()
+    if source is None:
+        raise DeploymentRetryConflict("deployment run not found")
+    source_action, source_status, source_context, proposal_id, run_status, proposal_status, brief_status = source
+    source_proposal_id = int(proposal_id)
+    target_proposal_id = int(replacement_proposal_id or source_proposal_id)
+    if source_action not in {"deploy", DEPLOYMENT_RETRY_ACTION}:
+        raise DeploymentRetryConflict("only deployment runs can be retried")
+    if source_status != "approved" or run_status != "failed":
+        raise DeploymentRetryConflict("only a failed deployment with an approved source request can be retried")
+    if proposal_status != "approved":
+        raise DeploymentRetryConflict("the deployment proposal is no longer approved")
+    if brief_status == "archived":
+        raise DeploymentRetryConflict("the Product Brief is archived")
+    if not planning_generation_matches(connection, source_context if isinstance(source_context, dict) else {}):
+        raise DeploymentRetryConflict("planning reset invalidated this deployment")
+    if target_proposal_id != source_proposal_id:
+        target = connection.execute(
+            """
+            SELECT target.status, target_task.work_item_id, target_worker.id,
+                   target_worker.role, target_technical.product_brief_id,
+                   target_start.context, source_task.work_item_id,
+                   source_worker.id, source_technical.product_brief_id
+            FROM agent_change_proposals AS target
+            JOIN agent_execution_tasks AS target_task
+                ON target_task.id = target.execution_task_id
+            JOIN agent_approval_requests AS target_start
+                ON target_start.id = target_task.start_approval_id
+            JOIN agent_worker_plans AS target_worker
+                ON target_worker.id = target_task.worker_plan_id
+            JOIN agent_engineering_plans AS target_engineering
+                ON target_engineering.id = target_worker.engineering_plan_id
+            JOIN agent_technical_plans AS target_technical
+                ON target_technical.id = target_engineering.technical_plan_id
+            JOIN agent_change_proposals AS source_proposal
+                ON source_proposal.id = %s
+            JOIN agent_execution_tasks AS source_task
+                ON source_task.id = source_proposal.execution_task_id
+            JOIN agent_worker_plans AS source_worker
+                ON source_worker.id = source_task.worker_plan_id
+            JOIN agent_engineering_plans AS source_engineering
+                ON source_engineering.id = source_worker.engineering_plan_id
+            JOIN agent_technical_plans AS source_technical
+                ON source_technical.id = source_engineering.technical_plan_id
+            WHERE target.id = %s
+            FOR UPDATE OF target
+            """,
+            (source_proposal_id, target_proposal_id),
+        ).fetchone()
+        if target is None:
+            raise DeploymentRetryConflict("replacement deployment proposal not found")
+        (
+            target_status,
+            target_work_item_id,
+            target_worker_plan_id,
+            target_role,
+            target_brief_id,
+            target_context,
+            source_work_item_id,
+            source_worker_plan_id,
+            source_brief_id,
+        ) = target
+        if target_status != "approved":
+            raise DeploymentRetryConflict("replacement deployment proposal is not approved")
+        if not isinstance(target_context, dict) or (
+            str(target_context.get("deployment_remediation_for_approval_id"))
+            != str(source_approval_id)
+            or str(target_context.get("deployment_remediation_for_proposal_id"))
+            != str(source_proposal_id)
+        ):
+            raise DeploymentRetryConflict("replacement deployment proposal is not linked to the failed deployment")
+        if target_role != "software_engineer":
+            raise DeploymentRetryConflict("replacement deployment proposal has no responsible Software Engineer")
+        if (
+            target_work_item_id != source_work_item_id
+            or int(target_worker_plan_id) != int(source_worker_plan_id)
+            or int(target_brief_id) != int(source_brief_id)
+        ):
+            raise DeploymentRetryConflict("replacement deployment proposal does not match the failed work item")
+    existing = connection.execute(
+        """
+        SELECT retry.id, retry.status, run.status
+        FROM agent_approval_requests AS retry
+        LEFT JOIN agent_deployment_runs AS run
+            ON run.approval_id = retry.id
+        WHERE retry.action = %s
+            AND retry.context->>'source_deployment_approval_id' = %s
+            AND retry.context->>'proposal_id' = %s
+            AND retry.status IN ('pending', 'approved')
+            AND (run.approval_id IS NULL OR run.status IN ('running', 'completed'))
+        ORDER BY retry.id DESC
+        LIMIT 1
+        """,
+        (DEPLOYMENT_RETRY_ACTION, str(source_approval_id), str(target_proposal_id)),
+    ).fetchone()
+    if existing:
+        raise DeploymentRetryConflict(
+            f"deployment retry approval {existing[0]} is already {existing[1]}"
+        )
+    context = add_planning_generation(
+        connection,
+        DEPLOYMENT_RETRY_ACTION,
+        {
+            "proposal_id": target_proposal_id,
+            "source_deployment_approval_id": int(source_approval_id),
+            "source_proposal_id": source_proposal_id,
+        },
+    )
+    request_id = create_approval_request(
+        connection,
+        AGENT_NAME,
+        DEPLOYMENT_RETRY_ACTION,
+        actor,
+        reason,
+        context,
+    )
+    decide_approval(
+        connection,
+        request_id,
+        "approved",
+        actor,
+        "Automatically approved by the deployment retry policy.",
+    )
+    record_audit_event(
+        connection,
+        AGENT_NAME,
+        "deployment_retry_approved",
+        actor,
+        str(request_id),
+        {
+            "source_deployment_approval_id": source_approval_id,
+            "source_proposal_id": source_proposal_id,
+            "proposal_id": target_proposal_id,
+            "automated": True,
+        },
+    )
+    connection.commit()
+    return int(request_id)
+
+
+def ensure_product_publication_approval(connection: psycopg.Connection, brief_id: int) -> int | None:
+    """Return or create the publication gate for a generated draft."""
+    existing = connection.execute(
+        """
+        SELECT id
+        FROM agent_approval_requests
+        WHERE action = 'approve_product_brief'
+          AND status IN ('pending', 'approved')
+          AND context->>'product_brief_id' = %s
+        ORDER BY id DESC
+        LIMIT 1
+        """,
+        (str(brief_id),),
+    ).fetchone()
+    if existing:
+        return int(existing[0])
+    brief = connection.execute(
+        "SELECT status FROM agent_product_briefs WHERE id = %s",
+        (brief_id,),
+    ).fetchone()
+    if brief is None or brief[0] != "draft":
+        return None
+    approval_id = create_approval_request(
+        connection,
+        AGENT_NAME,
+        "approve_product_brief",
+        OPERATOR_NAME,
+        f"Review and publish generated product brief {brief_id}.",
+        {"product_brief_id": brief_id},
+    )
+    record_audit_event(
+        connection,
+        AGENT_NAME,
+        "approval_requested",
+        OPERATOR_NAME,
+        str(approval_id),
+        {"action": "approve_product_brief", "product_brief_id": brief_id},
+    )
+    connection.commit()
+    return approval_id
+
+
+def product_brief_generation_response(connection: psycopg.Connection, brief_id: int) -> dict[str, object]:
+    row = connection.execute(
+        "SELECT status FROM agent_product_briefs WHERE id = %s",
+        (brief_id,),
+    ).fetchone()
+    if row is None:
+        raise RuntimeError("generated product brief could not be found")
+    publication_approval_id = connection.execute(
+        """
+        SELECT id
+        FROM agent_approval_requests
+        WHERE action = 'approve_product_brief'
+          AND status IN ('pending', 'approved')
+          AND context->>'product_brief_id' = %s
+        ORDER BY id DESC
+        LIMIT 1
+        """,
+        (str(brief_id),),
+    ).fetchone()
+    return {
+        "id": brief_id,
+        "status": row[0],
+        "schema_version": "1.0",
+        "publication_approval_id": int(publication_approval_id[0]) if publication_approval_id else None,
+    }
 
 
 def archive_product_brief_in_connection(
@@ -443,20 +1388,334 @@ def archive_product_brief_in_connection(
     return cancelled_ids
 
 
+def planning_reset_scope(connection: psycopg.Connection, lock: bool = False) -> PlanningResetScope:
+    """Describe the planning state a reset would invalidate without deleting it."""
+    generation = current_planning_generation(connection)
+    brief_query = """
+        SELECT id, status
+        FROM agent_product_briefs
+        WHERE status <> 'archived'
+        ORDER BY id
+    """
+    if lock:
+        brief_query += " FOR UPDATE"
+    brief_rows = connection.execute(brief_query).fetchall()
+    brief_ids = [int(row[0]) for row in brief_rows]
+    scope: PlanningResetScope = {
+        "planning_generation": generation,
+        "next_planning_generation": generation + 1,
+        "active_product_brief_ids": brief_ids,
+        "technical_plan_ids": [],
+        "engineering_plan_ids": [],
+        "worker_plan_ids": [],
+        "execution_task_ids": [],
+        "change_proposal_ids": [],
+        "approval_ids": [],
+        "cancelable_approval_ids": [],
+        "running_deployment_ids": [],
+        "completed_deployment_approval_ids": [],
+        "deployment_approval_ids": [],
+    }
+    technical_ids = [
+        int(row[0])
+        for row in connection.execute(
+            "SELECT id FROM agent_technical_plans WHERE product_brief_id = ANY(%s) ORDER BY id",
+            (brief_ids,),
+        ).fetchall()
+    ]
+    engineering_ids = [
+        int(row[0])
+        for row in connection.execute(
+            """
+            SELECT engineering.id
+            FROM agent_engineering_plans AS engineering
+            JOIN agent_technical_plans AS technical ON technical.id = engineering.technical_plan_id
+            WHERE technical.product_brief_id = ANY(%s)
+            ORDER BY engineering.id
+            """,
+            (brief_ids,),
+        ).fetchall()
+    ]
+    worker_ids = [
+        int(row[0])
+        for row in connection.execute(
+            """
+            SELECT worker.id
+            FROM agent_worker_plans AS worker
+            JOIN agent_engineering_plans AS engineering ON engineering.id = worker.engineering_plan_id
+            JOIN agent_technical_plans AS technical ON technical.id = engineering.technical_plan_id
+            WHERE technical.product_brief_id = ANY(%s)
+            ORDER BY worker.id
+            """,
+            (brief_ids,),
+        ).fetchall()
+    ]
+    task_ids = [
+        int(row[0])
+        for row in connection.execute(
+            """
+            SELECT task.id
+            FROM agent_execution_tasks AS task
+            JOIN agent_worker_plans AS worker ON worker.id = task.worker_plan_id
+            JOIN agent_engineering_plans AS engineering ON engineering.id = worker.engineering_plan_id
+            JOIN agent_technical_plans AS technical ON technical.id = engineering.technical_plan_id
+            WHERE technical.product_brief_id = ANY(%s)
+            ORDER BY task.id
+            """,
+            (brief_ids,),
+        ).fetchall()
+    ]
+    proposal_ids = [
+        int(row[0])
+        for row in connection.execute(
+            """
+            SELECT proposal.id
+            FROM agent_change_proposals AS proposal
+            JOIN agent_execution_tasks AS task ON task.id = proposal.execution_task_id
+            JOIN agent_worker_plans AS worker ON worker.id = task.worker_plan_id
+            JOIN agent_engineering_plans AS engineering ON engineering.id = worker.engineering_plan_id
+            JOIN agent_technical_plans AS technical ON technical.id = engineering.technical_plan_id
+            WHERE technical.product_brief_id = ANY(%s)
+            ORDER BY proposal.id
+            """,
+            (brief_ids,),
+        ).fetchall()
+    ]
+    deployment_rows = connection.execute(
+        """
+        SELECT deployment.approval_id, deployment.proposal_id, deployment.status
+        FROM agent_deployment_runs AS deployment
+        JOIN agent_approval_requests AS approval ON approval.id = deployment.approval_id
+        WHERE approval.action IN ('deploy', 'retry_deployment')
+          AND (
+              approval.context->>'planning_generation' = %s::text
+              OR (%s = 1 AND NOT (approval.context ? 'planning_generation'))
+          )
+        ORDER BY deployment.approval_id
+        """,
+        (generation, generation),
+    ).fetchall()
+    approval_rows = connection.execute(
+        """
+        SELECT id, action, status
+        FROM agent_approval_requests
+        WHERE action = ANY(%s)
+          AND status IN ('pending', 'approved')
+                    AND (
+                            context->>'planning_generation' = %s::text
+                            OR (%s = 1 AND NOT (context ? 'planning_generation'))
+                    )
+        ORDER BY id
+        """,
+                (list(PLANNING_ACTIONS), generation, generation),
+    ).fetchall()
+    completed_deployment_approval_ids = [
+        int(row[0]) for row in deployment_rows if row[2] == "completed"
+    ]
+    running_deployment_ids = [
+        int(row[0]) for row in deployment_rows if row[2] == "running"
+    ]
+    deployment_approval_ids = set(int(row[0]) for row in deployment_rows)
+    cancelable_approval_ids = [
+        int(row[0])
+        for row in approval_rows
+        if not (row[1] in {"deploy", DEPLOYMENT_RETRY_ACTION} and int(row[0]) in completed_deployment_approval_ids)
+    ]
+    scope.update(
+        {
+            "technical_plan_ids": technical_ids,
+            "engineering_plan_ids": engineering_ids,
+            "worker_plan_ids": worker_ids,
+            "execution_task_ids": task_ids,
+            "change_proposal_ids": proposal_ids,
+            "approval_ids": [int(row[0]) for row in approval_rows],
+            "cancelable_approval_ids": cancelable_approval_ids,
+            "running_deployment_ids": running_deployment_ids,
+            "completed_deployment_approval_ids": completed_deployment_approval_ids,
+            "deployment_approval_ids": sorted(deployment_approval_ids),
+        }
+    )
+    return scope
+
+
+def reset_planning_workspace_in_connection(
+    connection: psycopg.Connection,
+    actor: str,
+    reason: str,
+    confirmed: bool,
+    approval_id: int,
+) -> dict[str, object]:
+    """Invalidate the current planning generation while retaining its history."""
+    if not reason.strip():
+        raise ValueError("reset reason is required")
+    if not confirmed:
+        raise ValueError("reset requires explicit confirmation")
+    require_current_planning_approval(
+        connection,
+        approval_id,
+        "reset_planning_workspace",
+        lock_state=True,
+    )
+    generation = current_planning_generation(connection, lock=True)
+    scope = planning_reset_scope(connection, lock=True)
+    if int(scope["planning_generation"]) != generation:
+        raise PlanningResetConflict("planning reset preview is stale")
+    if scope["running_deployment_ids"]:
+        raise PlanningResetConflict(
+            "planning reset is blocked while deployment runs are active: "
+            + ", ".join(str(item) for item in scope["running_deployment_ids"])
+        )
+
+    now = datetime.now(timezone.utc)
+    archived_brief_ids = [
+        int(row[0])
+        for row in connection.execute(
+            """
+            UPDATE agent_product_briefs
+            SET status = 'archived', updated_at = %s
+            WHERE id = ANY(%s) AND status <> 'archived'
+            RETURNING id
+            """,
+            (now, scope["active_product_brief_ids"]),
+        ).fetchall()
+    ]
+    superseded_ids: dict[str, list[int]] = {}
+    for table_name, key, ids in (
+        ("agent_technical_plans", "technical_plan_ids", scope["technical_plan_ids"]),
+        ("agent_engineering_plans", "engineering_plan_ids", scope["engineering_plan_ids"]),
+        ("agent_worker_plans", "worker_plan_ids", scope["worker_plan_ids"]),
+        ("agent_execution_tasks", "execution_task_ids", scope["execution_task_ids"]),
+    ):
+        rows = connection.execute(
+            f"""
+            UPDATE {table_name}
+            SET status = 'superseded', updated_at = %s
+            WHERE id = ANY(%s) AND status NOT IN ('completed', 'superseded')
+            RETURNING id
+            """,
+            (now, ids),
+        ).fetchall()
+        superseded_ids[key] = [int(row[0]) for row in rows]
+    proposal_rows = connection.execute(
+        """
+        UPDATE agent_change_proposals
+        SET status = 'superseded', updated_at = %s
+        WHERE id = ANY(%s) AND status NOT IN ('completed', 'superseded')
+        RETURNING id
+        """,
+        (now, scope["change_proposal_ids"]),
+    ).fetchall()
+    superseded_ids["change_proposal_ids"] = [int(row[0]) for row in proposal_rows]
+
+    cancelled_approval_ids: list[int] = []
+    approval_rows = connection.execute(
+        """
+        SELECT id, action, status
+        FROM agent_approval_requests
+        WHERE action = ANY(%s)
+          AND status IN ('pending', 'approved')
+                    AND (
+                            context->>'planning_generation' = %s::text
+                            OR (%s = 1 AND NOT (context ? 'planning_generation'))
+                    )
+        ORDER BY id
+        FOR UPDATE
+        """,
+                (list(PLANNING_ACTIONS), generation, generation),
+    ).fetchall()
+    completed_deployment_ids = set(int(item) for item in scope["completed_deployment_approval_ids"])
+    for request_id, action, status in approval_rows:
+        if int(request_id) == approval_id:
+            continue
+        if action in {"deploy", DEPLOYMENT_RETRY_ACTION} and int(request_id) in completed_deployment_ids:
+            continue
+        updated = connection.execute(
+            """
+            UPDATE agent_approval_requests
+            SET status = 'cancelled', decided_by = %s, decided_at = %s,
+                decision_reason = %s
+            WHERE id = %s AND status IN ('pending', 'approved')
+            RETURNING id
+            """,
+            (
+                actor,
+                now,
+                f"Planning workspace reset: {reason}",
+                int(request_id),
+            ),
+        ).fetchone()
+        if updated:
+            cancelled_approval_ids.append(int(updated[0]))
+            record_audit_event(
+                connection,
+                AGENT_NAME,
+                "planning_approval_cancelled",
+                actor,
+                str(request_id),
+                {"action": action, "previous_status": status, "reason": reason},
+            )
+
+    new_generation = connection.execute(
+        """
+        UPDATE agent_planning_state
+        SET generation = generation + 1, updated_at = %s,
+            updated_by = %s, reset_reason = %s
+        WHERE id = %s
+        RETURNING generation
+        """,
+        (now, actor, reason, PLANNING_STATE_ID),
+    ).fetchone()
+    if new_generation is None:
+        raise RuntimeError("planning state could not be advanced")
+    result = {
+        "status": "reset",
+        "previous_planning_generation": generation,
+        "planning_generation": int(new_generation[0]),
+        "archived_product_brief_ids": archived_brief_ids,
+        "superseded": superseded_ids,
+        "cancelled_approval_ids": cancelled_approval_ids,
+        "preserved_completed_deployment_approval_ids": sorted(completed_deployment_ids),
+    }
+    for brief_id in archived_brief_ids:
+        record_audit_event(
+            connection,
+            PRODUCT_MANAGER_NAME,
+            "product_brief_archived",
+            actor,
+            str(brief_id),
+            {"reason": reason, "planning_reset": True, "planning_generation": generation},
+        )
+    record_audit_event(
+        connection,
+        AGENT_NAME,
+        "planning_workspace_reset",
+        actor,
+        str(approval_id),
+        result,
+    )
+    return result
+
+
 def start_automated_execution(approval_id: int, requested_by: str, context: dict) -> int:
     """Create an execution task atomically for an approved worker-plan handoff."""
     worker_plan_id = int(context["worker_plan_id"])
     work_item_id = str(context["work_item_id"]).strip()
     if not work_item_id:
         raise ValueError("work_item_id is required")
-    init_database()
     with psycopg.connect(DATABASE_URL) as connection:
+        require_current_planning_approval(
+            connection,
+            approval_id,
+            "start_software_engineer_execution",
+            lock_state=True,
+        )
         worker = connection.execute(
-            "SELECT role, status FROM agent_worker_plans WHERE id = %s",
+            "SELECT role, status, plan FROM agent_worker_plans WHERE id = %s",
             (worker_plan_id,),
         ).fetchone()
         if worker is None or worker[0] != "software_engineer" or worker[1] != "approved":
             raise ValueError("an approved software_engineer worker plan is required")
+        requirement_contract = validate_requirement_contract(worker[2].get("requirement_contract"))
         used = connection.execute(
             "SELECT id FROM agent_execution_tasks WHERE start_approval_id = %s",
             (approval_id,),
@@ -468,11 +1727,11 @@ def start_automated_execution(approval_id: int, requested_by: str, context: dict
             """
             INSERT INTO agent_execution_tasks
                 (worker_plan_id, work_item_id, requested_by, start_approval_id,
-                 status, created_at, updated_at)
-            VALUES (%s, %s, %s, %s, 'in_progress', %s, %s)
+                 status, requirement_contract, created_at, updated_at)
+            VALUES (%s, %s, %s, %s, 'in_progress', %s::jsonb, %s, %s)
             RETURNING id
             """,
-            (worker_plan_id, work_item_id, requested_by, approval_id, now, now),
+            (worker_plan_id, work_item_id, requested_by, approval_id, json.dumps(requirement_contract), now, now),
         ).fetchone()
         record_audit_event(
             connection,
@@ -545,24 +1804,40 @@ def submit_execution_evidence(task_id: int, implementation: dict[str, object]) -
         f"Automatically submit factual evidence for execution task {task_id}.",
         {"task_id": task_id},
     )
+    request_body = json.dumps({"approval_id": approval_id, **implementation}).encode("utf-8")
     request = urllib.request.Request(
         f"http://127.0.0.1:{AGENT_HTTP_PORT}/execution-tasks/{task_id}/submit",
-        data=json.dumps({"approval_id": approval_id, **implementation}).encode("utf-8"),
-        headers={"Authorization": f"Bearer {AGENT_APPROVAL_TOKEN}", "Content-Type": "application/json"},
+        data=request_body,
+        headers={
+            "Authorization": f"Bearer {AGENT_APPROVAL_TOKEN}",
+            "Content-Type": "application/json",
+            "Content-Length": str(len(request_body)),
+        },
         method="POST",
     )
     with urllib.request.urlopen(request, timeout=120) as response:
         json.load(response)
 
 
-def _scope_paths(worker_plan: dict[str, object]) -> list[str]:
+def _scope_paths(worker_plan: dict[str, object], work_item_id: str | None = None) -> list[str]:
+    workstream_id = str(work_item_id or "").strip()
+    if not workstream_id:
+        raise ExecutionConfigurationError("work item ID is required for approved repository scope")
+    grouped_surfaces = WORKSTREAM_FILE_GROUPS.get(workstream_id)
+    if grouped_surfaces is None:
+        raise ExecutionConfigurationError(f"unknown approved workstream: {workstream_id}")
+    raw_surfaces = worker_plan.get("files_or_surfaces", [])
+    if not isinstance(raw_surfaces, list):
+        raise ExecutionConfigurationError("approved worker plan has invalid repository file scope")
+    approved_surfaces = [str(value).strip() for value in raw_surfaces]
+    approved_surfaces = [surface for surface in grouped_surfaces if surface in approved_surfaces]
     paths = []
-    for value in worker_plan.get("files_or_surfaces", []):
+    for value in approved_surfaces:
         candidate = str(value).strip().replace("\\", "/")
         if re.fullmatch(r"[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)+", candidate):
             paths.append(candidate)
     if not paths:
-        raise RuntimeError("approved worker plan has no concrete repository file scope")
+        raise ExecutionConfigurationError("approved worker plan has no concrete repository file scope")
     return list(dict.fromkeys(paths))
 
 
@@ -579,21 +1854,56 @@ def _repository_file_path(surface: str) -> Path:
     return Path("/app") / relative
 
 
-def execute_work_item(task_id: int, work_item_id: str, worker_plan: dict[str, object]) -> dict[str, object]:
+def approved_qa_plan_for_engineering(
+    connection: psycopg.Connection,
+    engineering_plan_id: int,
+) -> int | None:
+    row = connection.execute(
+        """
+        SELECT id
+        FROM agent_worker_plans
+        WHERE engineering_plan_id = %s
+          AND role = 'qa_engineer'
+          AND status = 'approved'
+        ORDER BY updated_at DESC, id DESC
+        LIMIT 1
+        """,
+        (engineering_plan_id,),
+    ).fetchone()
+    return int(row[0]) if row else None
+
+
+def execute_work_item(
+    task_id: int,
+    work_item_id: str,
+    worker_plan: dict[str, object],
+    remediation_context: dict[str, object] | None = None,
+) -> dict[str, object]:
     """Run factual, bounded checks for any work item with concrete file scope."""
-    surfaces = _scope_paths(worker_plan)
+    surfaces = _scope_paths(worker_plan, work_item_id)
+    try:
+        requirement_contract = validate_requirement_contract(worker_plan.get("requirement_contract"))
+    except ValueError as error:
+        raise ExecutionConfigurationError(
+            f"{work_item_id} checks failed; approved requirement contract is invalid: {error}"
+        ) from error
     missing = [surface for surface in surfaces if not _repository_file_path(surface).is_file()]
     if missing:
-        raise RuntimeError(f"{work_item_id} checks failed; missing approved surfaces: {', '.join(missing)}")
+        raise ExecutionConfigurationError(
+            f"{work_item_id} checks failed; missing approved surfaces: {', '.join(missing)}"
+        )
     return {
         "summary": f"Verified approved repository surfaces for work item {work_item_id}.",
         "changed_surfaces": surfaces,
+        "requirement_contract": requirement_contract,
+        "acceptance_criteria": acceptance_checks(requirement_contract),
         "tests_run": [
             "Approved repository surface existence check",
             "Approved repository surface UTF-8 read check",
         ],
         "test_results": f"All bounded checks passed for {work_item_id}: approved surfaces exist and are readable. No repository mutation or deployment was performed by this worker.",
         "diff_reference": f"Execution task evidence for {work_item_id}; repository mutation is intentionally outside this worker's authority.",
+        "remediation": remediation_context or {},
     }
 
 
@@ -615,25 +1925,80 @@ def submit_qa_evidence(task_id: int, approval_id: int, qa_plan_id: int, qa_resul
 def run_qa_worker_once() -> None:
     """Review submitted implementation evidence using an approved QA plan."""
     with psycopg.connect(DATABASE_URL) as connection:
+        missing_handoffs = connection.execute(
+                        """
+                        SELECT task.id, engineering.id
+                        FROM agent_execution_tasks AS task
+                        JOIN agent_worker_plans AS worker ON worker.id = task.worker_plan_id
+                        JOIN agent_engineering_plans AS engineering ON engineering.id = worker.engineering_plan_id
+                        JOIN agent_technical_plans AS technical ON technical.id = engineering.technical_plan_id
+                        JOIN agent_product_briefs AS brief ON brief.id = technical.product_brief_id
+                        WHERE task.status = 'submitted'
+                            AND task.qa_plan_id IS NULL
+                            AND brief.status <> 'archived'
+                            AND NOT EXISTS (
+                                    SELECT 1
+                                    FROM agent_approval_requests AS approval
+                                    JOIN agent_worker_plans AS qa_plan
+                                        ON qa_plan.id = NULLIF(approval.context->>'qa_plan_id', '')::bigint
+                                     AND qa_plan.engineering_plan_id = engineering.id
+                                     AND qa_plan.role = 'qa_engineer'
+                                     AND qa_plan.status = 'approved'
+                                    WHERE approval.action = 'record_qa_validation'
+                                        AND approval.status = 'approved'
+                                        AND (approval.context->>'task_id')::bigint = task.id
+                            )
+                        ORDER BY task.id
+                        """
+                ).fetchall()
         rows = connection.execute(
             """
-                SELECT task.id, task.implementation, worker.plan,
+                 SELECT task.id, task.work_item_id, task.implementation, worker.plan,
                      (approval.context->>'qa_plan_id')::bigint, approval.id
             FROM agent_execution_tasks AS task
             JOIN agent_worker_plans AS worker ON worker.id = task.worker_plan_id
+                        JOIN agent_engineering_plans AS engineering ON engineering.id = worker.engineering_plan_id
+                        JOIN agent_technical_plans AS technical ON technical.id = engineering.technical_plan_id
+                        JOIN agent_product_briefs AS brief ON brief.id = technical.product_brief_id
             JOIN agent_approval_requests AS approval
               ON approval.action = 'record_qa_validation'
              AND approval.status = 'approved'
              AND (approval.context->>'task_id')::bigint = task.id
+            JOIN agent_worker_plans AS qa_plan
+              ON qa_plan.id = NULLIF(approval.context->>'qa_plan_id', '')::bigint
+             AND qa_plan.engineering_plan_id = engineering.id
+             AND qa_plan.role = 'qa_engineer'
+             AND qa_plan.status = 'approved'
             WHERE task.status = 'submitted'
               AND task.qa_plan_id IS NULL
+                            AND brief.status <> 'archived'
             ORDER BY task.id
             """
         ).fetchall()
-    for task_id, implementation, worker_plan, qa_plan_id, approval_id in rows:
+        handoff_requests = []
+        for task_id, engineering_plan_id in missing_handoffs:
+            qa_plan_id = approved_qa_plan_for_engineering(connection, int(engineering_plan_id))
+            if qa_plan_id is None:
+                logger.warning(
+                    "QA handoff waiting for an approved same-lineage plan: task_id=%s engineering_plan_id=%s",
+                    task_id,
+                    engineering_plan_id,
+                )
+                continue
+            handoff_requests.append((int(task_id), qa_plan_id))
+    for task_id, qa_plan_id in handoff_requests:
+        auto_approve_handoff(
+            "record_qa_validation",
+            QA_ENGINEER_NAME,
+            f"Automatically request QA validation for submitted execution task {task_id}.",
+            {"task_id": task_id, "qa_plan_id": qa_plan_id},
+        )
+    for task_id, work_item_id, implementation, worker_plan, qa_plan_id, approval_id in rows:
         try:
-            if not implementation or implementation.get("changed_surfaces") != _scope_paths(worker_plan):
+            requirement_contract = validate_requirement_contract(worker_plan.get("requirement_contract"))
+            if not implementation or implementation.get("changed_surfaces") != _scope_paths(worker_plan, work_item_id):
                 raise RuntimeError("implementation evidence has no changed surfaces")
+            require_complete_requirement_contract(implementation, requirement_contract)
             qa_result = {
                 "result": "passed",
                 "checks": [
@@ -655,7 +2020,10 @@ def run_qa_worker_once() -> None:
 
 def qa_worker_loop() -> None:
     while True:
-        run_qa_worker_once()
+        try:
+            run_qa_worker_once()
+        except Exception as error:
+            logger.exception("QA worker iteration failed: error=%s", type(error).__name__)
         time.sleep(EXECUTION_WORKER_INTERVAL_SECONDS)
 
 
@@ -676,133 +2044,225 @@ def submit_repository_proposal(task_id: int, worker_plan_id: int, proposal: dict
         result = json.load(response)
     proposal_id = int(result["id"])
     with psycopg.connect(DATABASE_URL) as connection:
-        qa_plan = connection.execute(
-            """
-            SELECT id FROM agent_worker_plans
-            WHERE role = 'qa_engineer' AND status = 'approved'
-            ORDER BY updated_at DESC, id DESC LIMIT 1
-            """
+        engineering_plan = connection.execute(
+            "SELECT engineering_plan_id FROM agent_worker_plans WHERE id = %s",
+            (worker_plan_id,),
         ).fetchone()
-    if qa_plan is None:
+        qa_plan_id = (
+            approved_qa_plan_for_engineering(connection, int(engineering_plan[0]))
+            if engineering_plan
+            else None
+        )
+    if qa_plan_id is None:
         raise RuntimeError("an approved qa_engineer worker plan is required for proposal QA")
     queue_automated_handoff(
         "review_repository_change",
         QA_ENGINEER_NAME,
-        {"proposal_id": proposal_id, "qa_plan_id": qa_plan[0]},
+        {"proposal_id": proposal_id, "qa_plan_id": qa_plan_id},
     )
+
+
+def _normalize_text(value: str) -> str:
+    return value.replace("\r\n", "\n").replace("\r", "\n")
+
+
+def _build_text_edit_patch(surface: str, source_text: str, old_text: str, new_text: str) -> str:
+    source_text = _normalize_text(source_text)
+    old_text = _normalize_text(old_text)
+    new_text = _normalize_text(new_text)
+    if not old_text:
+        raise ValueError("old_text must be non-empty")
+    if source_text.count(old_text) != 1:
+        raise ValueError("old_text must match exactly one contiguous source range")
+    updated_text = source_text.replace(old_text, new_text, 1)
+    if updated_text == source_text:
+        raise ValueError("text edit must change the source file")
+    diff = "".join(
+        difflib.unified_diff(
+            source_text.splitlines(keepends=True),
+            updated_text.splitlines(keepends=True),
+            fromfile=f"a/{surface}",
+            tofile=f"b/{surface}",
+            lineterm="\n",
+        )
+    )
+    if not diff:
+        raise ValueError("text edit did not produce a unified diff")
+    return f"diff --git a/{surface} b/{surface}\n{diff}"
 
 
 def generate_work_item_proposal(task_id: int, worker_plan_id: int, work_item_id: str, implementation: dict[str, object], plan: dict[str, object]) -> dict[str, object]:
-    surfaces = implementation.get("changed_surfaces", [])
-    current = "\n\n".join(
-        f"{surface}:\n{_repository_file_path(surface).read_text(encoding='utf-8')[:1800]}"
-        for surface in surfaces
+    litellm_master_key = LITELLM_MASTER_KEY
+    if not litellm_master_key:
+        raise RuntimeError("LITELLM_MASTER_KEY is required for repository proposal generation")
+    surfaces = _scope_paths(plan, work_item_id)
+    observed_surfaces = implementation.get("changed_surfaces")
+    if observed_surfaces != surfaces:
+        raise ValueError(
+            f"{work_item_id} implementation evidence surfaces do not match its approved surfaces"
+        )
+    system = (
+        "You are a careful repository-change engineer. Return compact JSON only. "
+        "Describe one exact text replacement; never output a unified diff or markdown."
     )
-    prompt = (
-        f"Create the smallest bounded repository change for work item {work_item_id}. This is a code-change task, not a request for an architecture summary. "
-        "Return one JSON object only with exactly these keys: summary, files, patch, tests. The patch must be a unified git diff "
-        "starting with diff --git and must contain exactly one diff --git block for every approved implementation surface. "
-        "Each block must use the exact a/ and b/ path for that surface; include all approved surfaces in the patch. Do not change infrastructure, "
-        "authentication, deployment, or unrelated surfaces. Do not describe the work instead of producing the JSON object. Use the approved worker plan and current file excerpts below. "
-        f"The files value MUST be this exact JSON array: {json.dumps(surfaces)}. The response shape is: "
-        '{"summary":"...","files":[' + ",".join(json.dumps(surface) for surface in surfaces) + '],"patch":"diff --git ...","tests":["..."]}. '
-        "The proposal is reviewed before any patch is applied.\n\n"
-        f"Approved worker requirements:\n{json.dumps({'scope': plan.get('scope', surfaces), 'steps': plan.get('implementation_steps', []), 'tests': plan.get('tests', [])}, indent=2, default=str)}\n\n"
-        f"Implementation evidence summary:\n{json.dumps({'summary': implementation.get('summary', ''), 'tests_run': implementation.get('tests_run', []), 'test_results': implementation.get('test_results', '')}, indent=2, default=str)}\n\n"
-        f"Approved implementation surfaces: {json.dumps(surfaces)}\nCurrent file excerpts (possibly incomplete; do not infer missing content):\n{current}"
-    )
-    system = "You are a careful repository-change engineer. Produce a minimal valid JSON proposal only."
 
-    def validate_generated_proposal(candidate: dict[str, object]) -> dict[str, object]:
+    def validate_generated_proposal(candidate: dict[str, object], expected_surfaces: list[str]) -> dict[str, object]:
         normalized = validate_change_proposal(candidate)
-        if normalized["files"] != surfaces:
+        if normalized["files"] != expected_surfaces:
             raise ValueError(f"{work_item_id} proposal must target exactly its approved implementation surfaces")
         patch_files = [source for source, target in re.findall(r"^diff --git a/([^\n]+) b/([^\n]+)$", normalized["patch"], re.MULTILINE)]
         patch_targets = [target for source, target in re.findall(r"^diff --git a/([^\n]+) b/([^\n]+)$", normalized["patch"], re.MULTILINE)]
-        if patch_files != patch_targets or patch_files != surfaces:
+        if patch_files != patch_targets or patch_files != expected_surfaces:
             raise ValueError(f"{work_item_id} proposal patch paths must exactly match its approved implementation surfaces")
-        with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".patch", delete=False) as patch_file:
-            patch_file.write(normalized["patch"].replace("\r", "").rstrip("\n") + "\n")
-            patch_path = patch_file.name
-        try:
+        with tempfile.TemporaryDirectory(prefix="aicorp-patch-") as validation_dir:
+            validation_root = Path(validation_dir) / "aicorp"
+            for surface in expected_surfaces:
+                source = _repository_file_path(surface)
+                destination = validation_root / surface.removeprefix("aicorp/")
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                destination.write_bytes(
+                    _normalize_text(source.read_text(encoding="utf-8")).encode("utf-8")
+                )
+            patch_path = Path(validation_dir) / "proposal.patch"
+            patch_path.write_text(
+                normalized["patch"].replace("\r", "").rstrip("\n") + "\n",
+                encoding="utf-8",
+            )
             result = subprocess.run(
-                ["patch", "--dry-run", "--batch", "--forward", "--ignore-whitespace", "-p2", "-i", patch_path],
-                cwd="/workspace/repository",
+                ["patch", "--dry-run", "--batch", "--forward", "--ignore-whitespace", "-p1", "-i", str(patch_path)],
+                cwd=validation_dir,
                 capture_output=True,
                 text=True,
                 check=False,
             )
-        finally:
-            Path(patch_path).unlink(missing_ok=True)
         if result.returncode != 0:
-            raise ValueError(f"{work_item_id} proposal patch must pass a repository dry-run")
+            diagnostic = (result.stdout + result.stderr).strip()[:2000]
+            raise ValueError(
+                f"{work_item_id} proposal patch must pass a repository dry-run; "
+                f"patch output: {diagnostic or '[no diagnostic output]'}"
+            )
         return normalized
 
-    proposal = _generate(LITELLM_BASE_URL, LITELLM_MASTER_KEY, WORKER_MODEL, system, prompt)
-    try:
-        return validate_generated_proposal(proposal)
-    except ValueError as error:
-        correction_prompt = (
-            prompt
-            + "\n\nThe previous proposal failed validation. "
-            + f"Regenerate the complete JSON now. The files array MUST be exactly {json.dumps(surfaces)} in this order, "
-            + f"the patch must contain one matching diff block for every one of those files. Every diff header must use the exact form `diff --git a/<surface> b/<surface>`, for example `diff --git a/{surfaces[0]} b/{surfaces[0]}`. "
-            "The tests array MUST contain at least one non-empty string. The patch must pass "
-            "a `patch --dry-run --batch --forward --ignore-whitespace -p2` check from the repository root. "
-            + f"The validation error was: {error}"
+    proposals = []
+    for surface in surfaces:
+        source_text = _normalize_text(_repository_file_path(surface).read_text(encoding="utf-8"))
+        prompt = (
+            f"Create the smallest bounded repository change for work item {work_item_id} in exactly one file. "
+            "If deployment failure evidence is present below, treat it as the defect report: diagnose each failed acceptance criterion, "
+            "make the corrective change in the approved surface, and do not merely restate or re-test the previous implementation. "
+            "Return one JSON object only with exactly these keys: summary, files, old_text, new_text, tests. "
+            f"The files value MUST be exactly {json.dumps([surface])}. "
+            "old_text MUST be copied verbatim from the current file and must match exactly one contiguous range. "
+            "new_text MUST contain only the replacement for that range. "
+            "Do not change any other file, infrastructure, authentication, deployment, or unrelated surface. "
+            "Keep the edit minimal and emit factual tests. The proposal is reviewed before any patch is applied. "
+            "Do not return a patch, diff headers, or markdown fences.\n\n"
+            f"Approved worker requirements:\n{json.dumps({'scope': plan.get('scope', surfaces), 'steps': plan.get('implementation_steps', []), 'tests': plan.get('tests', []), 'requirement_contract': plan.get('requirement_contract')}, indent=2, default=str)}\n\n"
+            f"Implementation evidence summary:\n{json.dumps({'summary': implementation.get('summary', ''), 'tests_run': implementation.get('tests_run', []), 'test_results': implementation.get('test_results', '')}, indent=2, default=str)}\n\n"
+            f"Deployment failure to remediate (empty for normal work):\n{json.dumps(implementation.get('remediation', {}), indent=2, default=str)}\n\n"
+            f"Approved implementation surface: {surface}\nCurrent complete file:\n<file>\n{source_text}\n</file>"
         )
-        try:
-            return validate_generated_proposal(
-                _generate(LITELLM_BASE_URL, LITELLM_MASTER_KEY, WORKER_MODEL, system, correction_prompt)
+        correction_prompt = prompt + (
+            f"\n\nRegenerate the complete JSON. Use only the exact file array {json.dumps([surface])}. "
+            "Copy old_text exactly from the current file and return one contiguous replacement."
+        )
+        last_error: Exception | None = None
+        for attempt in range(4):
+            try:
+                retry_prompt = correction_prompt
+                if last_error is not None:
+                    retry_prompt += f"\nThe previous validation error was: {last_error}"
+                candidate = _generate(
+                    LITELLM_BASE_URL,
+                    litellm_master_key,
+                    WORKER_MODEL,
+                    system,
+                    prompt if attempt == 0 else retry_prompt,
+                    max_tokens=PROPOSAL_MAX_TOKENS,
+                    think=False,
+                )
+                if not isinstance(candidate, dict):
+                    raise ValueError("structured proposal response must be a JSON object")
+                if set(candidate) != {"summary", "files", "old_text", "new_text", "tests"}:
+                    raise ValueError("structured proposal fields do not match the required schema")
+                if candidate["files"] != [surface]:
+                    raise ValueError(f"{work_item_id} proposal must target exactly its approved implementation surface")
+                old_text = candidate["old_text"]
+                new_text = candidate["new_text"]
+                if not isinstance(old_text, str) or not isinstance(new_text, str):
+                    raise ValueError("old_text and new_text must be strings")
+                proposal = {
+                    "summary": candidate["summary"],
+                    "files": [surface],
+                    "patch": _build_text_edit_patch(surface, source_text, old_text, new_text),
+                    "tests": candidate["tests"],
+                }
+                proposals.append(validate_generated_proposal(proposal, [surface]))
+                break
+            except GenerationBudgetExhaustedError:
+                raise
+            except (ValueError, json.JSONDecodeError) as error:
+                last_error = error
+        else:
+            raise RuntimeError(f"proposal validation failed after correction for {surface}: {last_error}") from last_error
+
+    combined = {
+        "summary": " ".join(str(proposal["summary"]) for proposal in proposals),
+        "files": surfaces,
+        "patch": "\n\n".join(str(proposal["patch"]) for proposal in proposals),
+        "tests": list(dict.fromkeys(test for proposal in proposals for test in proposal["tests"])),
+        "requirement_contract": validate_requirement_contract(plan.get("requirement_contract")),
+    }
+    return validate_generated_proposal(combined, surfaces)
+
+
+def mark_repository_task_failed(
+    task_id: int,
+    work_item_id: str,
+    error: GenerationBudgetExhaustedError,
+) -> None:
+    failure = {
+        "result": "failed",
+        "checks": ["Repository proposal generation stays within the configured output budget"],
+        "evidence": "Repository proposal generation stopped after the model exhausted its output budget; no proposal was submitted.",
+        "defects": ["Model output budget was exhausted before a bounded repository proposal was produced."],
+        "error_type": type(error).__name__,
+        "error": str(error)[:1000],
+    }
+    with psycopg.connect(DATABASE_URL) as connection:
+        updated = connection.execute(
+            """
+            UPDATE agent_execution_tasks
+            SET status = 'failed', qa_result = %s::jsonb, updated_at = %s
+            WHERE id = %s AND status = 'qa_passed'
+            RETURNING id
+            """,
+            (json.dumps(failure), datetime.now(timezone.utc), task_id),
+        ).fetchone()
+        if updated:
+            record_audit_event(
+                connection,
+                EXECUTION_AGENT_NAME,
+                "repository_proposal_generation_failed",
+                EXECUTION_AGENT_NAME,
+                str(task_id),
+                {"work_item_id": work_item_id, "error_type": type(error).__name__},
             )
-        except ValueError as correction_error:
-            raise RuntimeError(f"proposal validation failed after correction: {correction_error}") from correction_error
+        connection.commit()
 
 
 def run_repository_worker_once() -> None:
-    with psycopg.connect(DATABASE_URL) as connection:
-        deployment_barrier = connection.execute(
-            """
-            SELECT proposal.id, approval.id, deployment.status
-            FROM agent_change_proposals AS proposal
-                        JOIN agent_execution_tasks AS task
-                            ON task.id = proposal.execution_task_id
-                        JOIN agent_worker_plans AS worker
-                            ON worker.id = task.worker_plan_id
-                        JOIN agent_engineering_plans AS engineering
-                            ON engineering.id = worker.engineering_plan_id
-                        JOIN agent_technical_plans AS technical
-                            ON technical.id = engineering.technical_plan_id
-                        JOIN agent_product_briefs AS brief
-                            ON brief.id = technical.product_brief_id
-            JOIN agent_approval_requests AS approval
-              ON approval.action = 'deploy'
-             AND (approval.context->>'proposal_id')::bigint = proposal.id
-            LEFT JOIN agent_deployment_runs AS deployment
-              ON deployment.approval_id = approval.id
-            WHERE proposal.status = 'approved'
-                            AND brief.status <> 'archived'
-                            AND approval.status IN ('pending', 'approved')
-              AND (deployment.approval_id IS NULL OR deployment.status <> 'completed')
-            LIMIT 1
-            """
-        ).fetchone()
-    if deployment_barrier:
-        proposal_id, approval_id, deployment_status = deployment_barrier
-        logger.info(
-            "repository worker waiting for approved proposal deployment: proposal_id=%s approval_id=%s deployment_status=%s",
-            proposal_id,
-            approval_id,
-            deployment_status or "not_started",
-        )
-        return
     with psycopg.connect(DATABASE_URL) as connection:
         rows = connection.execute(
             """
             SELECT task.id, task.work_item_id, task.worker_plan_id, task.implementation, plan.plan
             FROM agent_execution_tasks AS task
             JOIN agent_worker_plans AS plan ON plan.id = task.worker_plan_id
+                        JOIN agent_engineering_plans AS engineering ON engineering.id = plan.engineering_plan_id
+                        JOIN agent_technical_plans AS technical ON technical.id = engineering.technical_plan_id
+                        JOIN agent_product_briefs AS brief ON brief.id = technical.product_brief_id
             WHERE task.status = 'qa_passed'
+                            AND brief.status <> 'archived'
               AND (
                     SELECT count(*)
                     FROM agent_change_proposals AS failed
@@ -818,13 +2278,31 @@ def run_repository_worker_once() -> None:
             ORDER BY task.id
             """
         ).fetchall()
+    workstream_order = {workstream_id: index for index, workstream_id in enumerate(WORKSTREAM_ORDER)}
+    rows = sorted(rows, key=lambda row: (workstream_order.get(str(row[1]), len(WORKSTREAM_ORDER)), int(row[0])))
     for task_id, work_item_id, worker_plan_id, implementation, plan in rows:
+        with psycopg.connect(DATABASE_URL) as connection:
+            if not workstream_dependencies_completed(connection, int(worker_plan_id), str(work_item_id)):
+                logger.info(
+                    "repository worker waiting for predecessor deployment: task_id=%s work_item_id=%s",
+                    task_id,
+                    work_item_id,
+                )
+                continue
         try:
             proposal = generate_work_item_proposal(task_id, worker_plan_id, work_item_id, implementation, plan)
             submit_repository_proposal(task_id, worker_plan_id, proposal)
             logger.info("repository worker submitted proposal: task_id=%s", task_id)
+        except GenerationBudgetExhaustedError as error:
+            mark_repository_task_failed(task_id, str(work_item_id), error)
+            logger.error(
+                "repository worker stopped terminally after output budget exhaustion: task_id=%s work_item_id=%s",
+                task_id,
+                work_item_id,
+            )
         except Exception as error:
             logger.exception("repository worker failed: task_id=%s error=%s", task_id, type(error).__name__)
+        break
 
 
 def repository_worker_loop() -> None:
@@ -840,12 +2318,32 @@ def run_proposal_qa_worker_once() -> None:
     with psycopg.connect(DATABASE_URL) as connection:
         missing_handoffs = connection.execute(
             """
-            SELECT proposal.id
+                        SELECT proposal.id,
+                                     (
+                                             SELECT qa.id
+                                             FROM agent_worker_plans AS qa
+                                             WHERE qa.engineering_plan_id = engineering.id
+                                                 AND qa.role = 'qa_engineer'
+                                                 AND qa.status = 'approved'
+                                             ORDER BY qa.updated_at DESC, qa.id DESC
+                                             LIMIT 1
+                                     ) AS qa_plan_id
             FROM agent_change_proposals AS proposal
                         JOIN agent_execution_tasks AS task ON task.id = proposal.execution_task_id
+                        JOIN agent_worker_plans AS worker ON worker.id = task.worker_plan_id
+                        JOIN agent_engineering_plans AS engineering ON engineering.id = worker.engineering_plan_id
+                        JOIN agent_technical_plans AS technical ON technical.id = engineering.technical_plan_id
+                        JOIN agent_product_briefs AS brief ON brief.id = technical.product_brief_id
                         WHERE proposal.status = 'proposed'
+                            AND brief.status <> 'archived'
               AND NOT EXISTS (
-                  SELECT 1 FROM agent_approval_requests AS approval
+                                    SELECT 1
+                                    FROM agent_approval_requests AS approval
+                                    JOIN agent_worker_plans AS qa
+                                        ON qa.id = NULLIF(approval.context->>'qa_plan_id', '')::bigint
+                                     AND qa.engineering_plan_id = engineering.id
+                                     AND qa.role = 'qa_engineer'
+                                     AND qa.status = 'approved'
                   WHERE approval.action = 'review_repository_change'
                     AND approval.status = 'approved'
                     AND (approval.context->>'proposal_id')::bigint = proposal.id
@@ -853,25 +2351,19 @@ def run_proposal_qa_worker_once() -> None:
             ORDER BY proposal.id
             """
         ).fetchall()
-        qa_plan = connection.execute(
-            """
-            SELECT id FROM agent_worker_plans
-            WHERE role = 'qa_engineer' AND status = 'approved'
-            ORDER BY updated_at DESC, id DESC LIMIT 1
-            """
-        ).fetchone()
-    if missing_handoffs and qa_plan is None:
-        raise RuntimeError("an approved qa_engineer worker plan is required for proposal QA")
-    for (proposal_id,) in missing_handoffs:
+    for proposal_id, qa_plan_id in missing_handoffs:
+        if qa_plan_id is None:
+            logger.warning("proposal QA waiting for same-lineage QA plan: proposal_id=%s", proposal_id)
+            continue
         queue_automated_handoff(
             "review_repository_change",
             QA_ENGINEER_NAME,
-            {"proposal_id": proposal_id, "qa_plan_id": qa_plan[0]},
+            {"proposal_id": proposal_id, "qa_plan_id": qa_plan_id},
         )
     with psycopg.connect(DATABASE_URL) as connection:
         rows = connection.execute(
             """
-                 SELECT proposal.id, proposal.proposal, task.implementation, worker.plan, approval.id,
+                 SELECT proposal.id, proposal.proposal, task.work_item_id, task.implementation, worker.plan, approval.id,
                      (approval.context->>'qa_plan_id')::bigint
             FROM agent_change_proposals AS proposal
             JOIN agent_approval_requests AS approval
@@ -880,16 +2372,27 @@ def run_proposal_qa_worker_once() -> None:
              AND (approval.context->>'proposal_id')::bigint = proposal.id
             JOIN agent_execution_tasks AS task ON task.id = proposal.execution_task_id
             JOIN agent_worker_plans AS worker ON worker.id = task.worker_plan_id
+            JOIN agent_engineering_plans AS engineering ON engineering.id = worker.engineering_plan_id
+            JOIN agent_technical_plans AS technical ON technical.id = engineering.technical_plan_id
+            JOIN agent_product_briefs AS brief ON brief.id = technical.product_brief_id
+                        JOIN agent_worker_plans AS qa_plan
+                            ON qa_plan.id = NULLIF(approval.context->>'qa_plan_id', '')::bigint
+                         AND qa_plan.engineering_plan_id = engineering.id
+                         AND qa_plan.role = 'qa_engineer'
+                         AND qa_plan.status = 'approved'
             WHERE proposal.status = 'proposed'
+              AND brief.status <> 'archived'
             ORDER BY proposal.id
             """
         ).fetchall()
-    for proposal_id, proposal, implementation, worker_plan, approval_id, qa_plan_id in rows:
+    for proposal_id, proposal, work_item_id, implementation, worker_plan, approval_id, qa_plan_id in rows:
         try:
             files = proposal.get("files")
             if qa_plan_id is None:
                 raise RuntimeError("proposal QA handoff is missing qa_plan_id")
-            expected_files = _scope_paths(worker_plan)
+            requirement_contract = validate_requirement_contract(worker_plan.get("requirement_contract"))
+            require_complete_requirement_contract(proposal, requirement_contract)
+            expected_files = _scope_paths(worker_plan, work_item_id)
             implementation_files = implementation.get("changed_surfaces") if isinstance(implementation, dict) else []
             patch = str(proposal.get("patch", ""))
             patch_files = [source for source, target in re.findall(r"^diff --git a/([^\n]+) b/([^\n]+)$", patch, re.MULTILINE)]
@@ -897,20 +2400,28 @@ def run_proposal_qa_worker_once() -> None:
             patch_matches_files = bool(patch_files) and patch_files == patch_targets and set(patch_files) == set(files or [])
             patch_applies = False
             if patch_matches_files:
-                with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".patch", delete=False) as patch_file:
-                    patch_file.write(patch.replace("\r", "").rstrip("\n") + "\n")
-                    patch_path = patch_file.name
-                try:
+                with tempfile.TemporaryDirectory(prefix="aicorp-proposal-qa-") as validation_dir:
+                    validation_root = Path(validation_dir) / "aicorp"
+                    for surface in expected_files:
+                        source = _repository_file_path(surface)
+                        destination = validation_root / surface.removeprefix("aicorp/")
+                        destination.parent.mkdir(parents=True, exist_ok=True)
+                        destination.write_bytes(
+                            _normalize_text(source.read_text(encoding="utf-8")).encode("utf-8")
+                        )
+                    patch_path = Path(validation_dir) / "proposal.patch"
+                    patch_path.write_text(
+                        _normalize_text(patch).rstrip("\n") + "\n",
+                        encoding="utf-8",
+                    )
                     patch_result = subprocess.run(
-                        ["patch", "--dry-run", "--batch", "--forward", "--ignore-whitespace", "-p2", "-i", patch_path],
-                        cwd="/workspace/repository",
+                        ["patch", "--dry-run", "--batch", "--forward", "--ignore-whitespace", "-p1", "-i", str(patch_path)],
+                        cwd=validation_dir,
                         capture_output=True,
                         text=True,
                         check=False,
                     )
                     patch_applies = patch_result.returncode == 0
-                finally:
-                    Path(patch_path).unlink(missing_ok=True)
             if files != expected_files or implementation_files != expected_files or not isinstance(files, list) or not files or any(not _scope_path_is_safe(str(path)) for path in files) or not patch.startswith("diff --git ") or not patch_matches_files or not patch_applies:
                 request = urllib.request.Request(
                     f"http://127.0.0.1:{AGENT_HTTP_PORT}/change-proposals/{proposal_id}/qa",
@@ -938,8 +2449,9 @@ def run_proposal_qa_worker_once() -> None:
                         "Proposal targets only approved repository surfaces",
                         "Proposal contains a unified git diff",
                         "Proposal is bounded to approved worker-plan repository surfaces",
+                        "Proposal preserves the complete Product Brief requirement contract",
                     ],
-                    "evidence": "QA verified the generated proposal is a bounded unified diff for approved repository surfaces.",
+                    "evidence": "QA verified the generated proposal is a bounded unified diff and preserves the complete Product Brief requirement contract.",
                     "defects": [],
                 }).encode("utf-8"),
                 headers={"Authorization": f"Bearer {AGENT_APPROVAL_TOKEN}", "Content-Type": "application/json"},
@@ -955,7 +2467,10 @@ def run_proposal_qa_worker_once() -> None:
 
 def proposal_qa_worker_loop() -> None:
     while True:
-        run_proposal_qa_worker_once()
+        try:
+            run_proposal_qa_worker_once()
+        except Exception as error:
+            logger.exception("proposal QA worker iteration failed: error=%s", type(error).__name__)
         time.sleep(EXECUTION_WORKER_INTERVAL_SECONDS)
 
 
@@ -966,18 +2481,41 @@ def workstream_deployment_completed(connection: psycopg.Connection, task_id: int
                 SELECT 1
                 FROM agent_change_proposals AS proposal
                 JOIN agent_approval_requests AS approval
-                    ON approval.action = 'deploy'
+                    ON approval.action IN ('deploy', 'retry_deployment')
                  AND (approval.context->>'proposal_id')::bigint = proposal.id
                 JOIN agent_deployment_runs AS deployment
                     ON deployment.approval_id = approval.id
                 WHERE proposal.execution_task_id = %s
-                    AND proposal.status = 'approved'
                     AND approval.status = 'approved'
                     AND deployment.status = 'completed'
                 LIMIT 1
                 """,
                 (task_id,),
         ).fetchone() is not None
+
+
+def workstream_dependencies_completed(
+    connection: psycopg.Connection,
+    worker_plan_id: int,
+    work_item_id: str,
+) -> bool:
+    predecessors = WORKSTREAM_PREDECESSORS.get(work_item_id)
+    if predecessors is None:
+        raise RuntimeError(f"unknown approved workstream: {work_item_id}")
+    for predecessor in predecessors:
+        predecessor_task = connection.execute(
+            """
+            SELECT id
+            FROM agent_execution_tasks
+            WHERE worker_plan_id = %s AND work_item_id = %s
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (worker_plan_id, predecessor),
+        ).fetchone()
+        if predecessor_task is None or not workstream_deployment_completed(connection, int(predecessor_task[0])):
+            return False
+    return True
 
 
 def reconcile_workflow_completion(connection: psycopg.Connection, proposal_id: int) -> None:
@@ -998,6 +2536,20 @@ def reconcile_workflow_completion(connection: psycopg.Connection, proposal_id: i
     if task_row is None:
         raise RuntimeError(f"proposal {proposal_id} has no workflow lineage")
     task_id, worker_plan_id, engineering_plan_id, technical_plan_id, product_brief_id = task_row
+    requirement_row = connection.execute(
+        "SELECT requirements FROM agent_product_briefs WHERE id = %s",
+        (product_brief_id,),
+    ).fetchone()
+    if requirement_row is None:
+        return
+    try:
+        requirement_contract = validate_requirement_contract(requirement_row[0], int(product_brief_id))
+    except ValueError:
+        return
+    if not all(item["status"] == "done" for item in requirement_contract["items"]):
+        return
+    if not all(goal["status"] == "achieved" for goal in requirement_contract["goals"]):
+        return
     now_value = datetime.now(timezone.utc)
     task_updated = connection.execute(
         """
@@ -1030,6 +2582,10 @@ def reconcile_workflow_completion(connection: psycopg.Connection, proposal_id: i
         UPDATE agent_worker_plans AS worker
         SET status = 'completed', updated_at = %s
         WHERE worker.engineering_plan_id = %s AND worker.status = 'approved'
+                    AND EXISTS (
+                            SELECT 1 FROM agent_execution_tasks AS task
+                            WHERE task.worker_plan_id = worker.id
+                    )
           AND NOT EXISTS (
               SELECT 1 FROM agent_execution_tasks AS task
               WHERE task.worker_plan_id = worker.id AND task.status <> 'completed'
@@ -1092,9 +2648,12 @@ def run_work_item_orchestrator_once() -> None:
             SELECT worker.id, worker.engineering_plan_id, plan.plan
             FROM agent_worker_plans AS worker
             JOIN agent_engineering_plans AS plan ON plan.id = worker.engineering_plan_id
+                        JOIN agent_technical_plans AS technical ON technical.id = plan.technical_plan_id
+                        JOIN agent_product_briefs AS brief ON brief.id = technical.product_brief_id
             WHERE worker.role = 'software_engineer'
               AND worker.status = 'approved'
               AND plan.status = 'approved'
+                            AND brief.status <> 'archived'
             ORDER BY worker.id DESC
             LIMIT 1
             """
@@ -1121,6 +2680,12 @@ def run_work_item_orchestrator_once() -> None:
                 if not workstream_deployment_completed(connection, int(task[0])):
                     return
                 continue
+            if not workstream_dependencies_completed(connection, int(worker_plan_id), work_item_id):
+                logger.info(
+                    "work-item orchestrator waiting for predecessor deployment: work_item_id=%s",
+                    work_item_id,
+                )
+                return
         approval_id = auto_approve_handoff(
             "start_software_engineer_execution",
             SOFTWARE_ENGINEER_NAME,
@@ -1144,24 +2709,89 @@ def work_item_orchestrator_loop() -> None:
         time.sleep(EXECUTION_WORKER_INTERVAL_SECONDS)
 
 
+def mark_execution_task_failed(
+    task_id: int,
+    work_item_id: str,
+    details: dict[str, object],
+) -> None:
+    failure = {
+        "result": "failed",
+        "checks": ["Approved worker plan contains concrete repository scope"],
+        "evidence": f"Execution stopped before repository mutation: {details.get('error', 'unknown execution configuration error')}",
+        "defects": [str(details.get("error", "unknown execution configuration error"))],
+        **details,
+    }
+    with psycopg.connect(DATABASE_URL) as connection:
+        updated = connection.execute(
+            """
+            UPDATE agent_execution_tasks
+            SET status = 'failed', qa_result = %s::jsonb, updated_at = %s
+            WHERE id = %s AND status = 'in_progress'
+            RETURNING id
+            """,
+            (json.dumps(failure), datetime.now(timezone.utc), task_id),
+        ).fetchone()
+        if updated:
+            record_audit_event(
+                connection,
+                EXECUTION_AGENT_NAME,
+                "execution_task_failed",
+                SOFTWARE_ENGINEER_NAME,
+                str(task_id),
+                {"work_item_id": work_item_id, **details},
+            )
+        connection.commit()
+
+
 def run_execution_worker_once() -> None:
     """Claim supported in-progress tasks by submitting only observed evidence."""
     with psycopg.connect(DATABASE_URL) as connection:
         tasks = connection.execute(
             """
-            SELECT task.id, task.work_item_id, plan.plan
+            SELECT task.id, task.work_item_id, plan.plan, approval.context
             FROM agent_execution_tasks AS task
             JOIN agent_worker_plans AS plan ON plan.id = task.worker_plan_id
+            JOIN agent_approval_requests AS approval ON approval.id = task.start_approval_id
             WHERE task.status = 'in_progress'
             ORDER BY task.id
             """
         ).fetchall()
-    for task_id, work_item_id, worker_plan in tasks:
+    for task_id, work_item_id, worker_plan, approval_context in tasks:
         try:
-            submit_execution_evidence(task_id, execute_work_item(task_id, work_item_id, worker_plan))
+            remediation_context = (
+                approval_context.get("deployment_failure")
+                if isinstance(approval_context, dict)
+                else None
+            )
+            submit_execution_evidence(
+                task_id,
+                execute_work_item(task_id, work_item_id, worker_plan, remediation_context),
+            )
             logger.info("execution worker submitted evidence: task_id=%s work_item_id=%s", task_id, work_item_id)
+        except ExecutionConfigurationError as error:
+            details = dispatch_error_details(error)
+            logger.error(
+                "execution worker stopped deterministic failure: task_id=%s work_item_id=%s details=%s",
+                task_id,
+                work_item_id,
+                details,
+            )
+            mark_execution_task_failed(task_id, work_item_id, details)
         except Exception as error:
-            logger.exception("execution worker failed: task_id=%s error=%s", task_id, type(error).__name__)
+            details = dispatch_error_details(error)
+            if "an approved qa_engineer worker plan is required for automatic QA handoff" in str(details.get("response", "")):
+                logger.info(
+                    "execution worker deferred QA handoff until an approved QA plan exists: task_id=%s work_item_id=%s",
+                    task_id,
+                    work_item_id,
+                )
+                continue
+            logger.exception(
+                "execution worker failed: task_id=%s error=%s details=%s",
+                task_id,
+                type(error).__name__,
+                details,
+            )
             with psycopg.connect(DATABASE_URL) as connection:
                 record_audit_event(
                     connection,
@@ -1169,20 +2799,25 @@ def run_execution_worker_once() -> None:
                     "execution_worker_failed",
                     SOFTWARE_ENGINEER_NAME,
                     str(task_id),
-                    {"work_item_id": work_item_id, "error_type": type(error).__name__},
+                    {"work_item_id": work_item_id, **details},
                 )
                 connection.commit()
 
 
 def execution_worker_loop() -> None:
     while True:
-        run_execution_worker_once()
+        try:
+            run_execution_worker_once()
+        except Exception as error:
+            logger.exception("execution worker iteration failed: error=%s", type(error).__name__)
         time.sleep(EXECUTION_WORKER_INTERVAL_SECONDS)
 
 
 def init_database() -> None:
     reconciled_task_ids: list[int] = []
     with psycopg.connect(DATABASE_URL) as connection:
+        init_governance_tables(connection)
+        init_product_tables(connection)
         connection.execute(
             """
             CREATE TABLE IF NOT EXISTS agent_runs (
@@ -1198,6 +2833,26 @@ def init_database() -> None:
         )
         connection.execute(
             """
+            CREATE TABLE IF NOT EXISTS agent_planning_state (
+                id SMALLINT PRIMARY KEY,
+                generation BIGINT NOT NULL CHECK (generation > 0),
+                updated_at TIMESTAMPTZ NOT NULL,
+                updated_by TEXT NOT NULL,
+                reset_reason TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO agent_planning_state
+                (id, generation, updated_at, updated_by, reset_reason)
+            VALUES (%s, 1, %s, %s, %s)
+            ON CONFLICT (id) DO NOTHING
+            """,
+            (PLANNING_STATE_ID, datetime.now(timezone.utc), AGENT_NAME, "initial planning generation"),
+        )
+        connection.execute(
+            """
             CREATE TABLE IF NOT EXISTS agent_product_briefs (
                 id BIGSERIAL PRIMARY KEY,
                 agent_name TEXT NOT NULL,
@@ -1207,6 +2862,7 @@ def init_database() -> None:
                 status TEXT NOT NULL DEFAULT 'draft',
                 brief JSONB NOT NULL,
                 backlog JSONB NOT NULL,
+                requirements JSONB NOT NULL DEFAULT '{}'::jsonb,
                 source_context TEXT NOT NULL,
                 created_at TIMESTAMPTZ NOT NULL,
                 updated_at TIMESTAMPTZ NOT NULL,
@@ -1214,6 +2870,9 @@ def init_database() -> None:
                     CHECK (status IN ('draft', 'approved', 'rejected'))
             )
             """
+        )
+        connection.execute(
+            "ALTER TABLE agent_product_briefs ADD COLUMN IF NOT EXISTS requirements JSONB NOT NULL DEFAULT '{}'::jsonb"
         )
         connection.execute(
             "ALTER TABLE agent_product_briefs DROP CONSTRAINT IF EXISTS agent_product_brief_status_check"
@@ -1304,12 +2963,16 @@ def init_database() -> None:
                 implementation JSONB,
                 qa_result JSONB,
                 qa_plan_id BIGINT REFERENCES agent_worker_plans(id),
+                requirement_contract JSONB NOT NULL DEFAULT '{}'::jsonb,
                 created_at TIMESTAMPTZ NOT NULL,
                 updated_at TIMESTAMPTZ NOT NULL,
                 CONSTRAINT agent_execution_status_check
-                    CHECK (status IN ('ready', 'in_progress', 'submitted', 'qa_passed', 'qa_failed', 'completed'))
+                    CHECK (status IN ('ready', 'in_progress', 'submitted', 'qa_passed', 'qa_failed', 'failed', 'completed'))
             )
             """
+        )
+        connection.execute(
+            "ALTER TABLE agent_execution_tasks ADD COLUMN IF NOT EXISTS requirement_contract JSONB NOT NULL DEFAULT '{}'::jsonb"
         )
         connection.execute(
             """
@@ -1322,6 +2985,7 @@ def init_database() -> None:
                 status TEXT NOT NULL DEFAULT 'proposed',
                 qa_plan_id BIGINT REFERENCES agent_worker_plans(id),
                 qa_result JSONB,
+                requirement_contract JSONB NOT NULL DEFAULT '{}'::jsonb,
                 created_at TIMESTAMPTZ NOT NULL,
                 updated_at TIMESTAMPTZ NOT NULL,
                 CONSTRAINT agent_change_proposal_status_check
@@ -1330,12 +2994,30 @@ def init_database() -> None:
             """
         )
         connection.execute(
+            "ALTER TABLE agent_change_proposals ADD COLUMN IF NOT EXISTS requirement_contract JSONB NOT NULL DEFAULT '{}'::jsonb"
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS agent_deployment_runs (
+                approval_id BIGINT PRIMARY KEY REFERENCES agent_approval_requests(id),
+                proposal_id BIGINT NOT NULL REFERENCES agent_change_proposals(id),
+                status TEXT NOT NULL,
+                evidence JSONB NOT NULL DEFAULT '{}'::jsonb,
+                started_at TIMESTAMPTZ NOT NULL,
+                completed_at TIMESTAMPTZ,
+                CONSTRAINT agent_deployment_run_status_check
+                    CHECK (status IN ('running', 'completed', 'failed'))
+            )
+            """
+        )
+        connection.execute(
             "ALTER TABLE agent_change_proposals DROP CONSTRAINT IF EXISTS agent_change_proposal_status_check"
         )
         for table_name, constraint_name, statuses in (
-            ("agent_technical_plans", "agent_technical_plan_status_check", "'draft', 'approved', 'rejected', 'completed'"),
-            ("agent_engineering_plans", "agent_engineering_plan_status_check", "'draft', 'approved', 'rejected', 'completed'"),
-            ("agent_worker_plans", "agent_worker_plan_status_check", "'draft', 'approved', 'rejected', 'completed'"),
+            ("agent_technical_plans", "agent_technical_plan_status_check", "'draft', 'approved', 'rejected', 'completed', 'superseded'"),
+            ("agent_engineering_plans", "agent_engineering_plan_status_check", "'draft', 'approved', 'rejected', 'completed', 'superseded'"),
+            ("agent_worker_plans", "agent_worker_plan_status_check", "'draft', 'approved', 'rejected', 'completed', 'superseded'"),
+            ("agent_execution_tasks", "agent_execution_status_check", "'ready', 'in_progress', 'submitted', 'qa_passed', 'qa_failed', 'failed', 'completed', 'superseded'"),
         ):
             connection.execute(f"ALTER TABLE {table_name} DROP CONSTRAINT IF EXISTS {constraint_name}")
             connection.execute(
@@ -1345,10 +3027,20 @@ def init_database() -> None:
             """
             ALTER TABLE agent_change_proposals
             ADD CONSTRAINT agent_change_proposal_status_check
-            CHECK (status IN ('proposed', 'qa_passed', 'qa_failed', 'approved', 'superseded'))
+            CHECK (status IN ('proposed', 'qa_passed', 'qa_failed', 'approved', 'completed', 'superseded'))
             """
         )
-        init_governance_tables(connection)
+        for brief_id, brief, backlog, stored_contract in connection.execute(
+            "SELECT id, brief, backlog, requirements FROM agent_product_briefs"
+        ).fetchall():
+            try:
+                validate_requirement_contract(stored_contract, int(brief_id))
+            except ValueError:
+                contract = build_requirement_contract(int(brief_id), brief, backlog)
+                connection.execute(
+                    "UPDATE agent_product_briefs SET requirements = %s::jsonb WHERE id = %s",
+                    (json.dumps(contract), brief_id),
+                )
         invalid_evidence = connection.execute(
             """
             UPDATE agent_execution_tasks
@@ -1447,8 +3139,9 @@ def retrieve_knowledge(query: str) -> str:
     if not OLLAMA_BASE_URL:
         return ""
     try:
+        ollama_base_url = native_ollama_base_url(OLLAMA_BASE_URL)
         embedding_request = urllib.request.Request(
-            f"{OLLAMA_BASE_URL}/api/embeddings",
+            f"{ollama_base_url}/api/embeddings",
             data=json.dumps({"model": EMBEDDING_MODEL, "prompt": query}).encode(),
             headers={"Content-Type": "application/json"},
             method="POST",
@@ -1468,8 +3161,12 @@ def retrieve_knowledge(query: str) -> str:
             for item in results
             if item.get("payload", {}).get("text")
         )
-    except (urllib.error.URLError, urllib.error.HTTPError, KeyError, ValueError):
-        logger.warning("knowledge retrieval unavailable")
+    except (urllib.error.URLError, urllib.error.HTTPError, KeyError, TypeError, ValueError, TimeoutError) as error:
+        logger.warning(
+            "knowledge retrieval unavailable: error_type=%s detail=%s",
+            type(error).__name__,
+            str(error)[:300],
+        )
         return ""
 
 
@@ -1492,7 +3189,17 @@ def generate_report(context: str) -> str:
         ],
     }
     if MODEL_NAME != "gpt-5.6-luna":
-        payload["temperature"] = 0.1
+        payload.update(
+            {
+                "temperature": 0.1,
+                "max_tokens": REASONING_MAX_TOKENS,
+                "think": True,
+                "extra_body": {
+                    "think": True,
+                    "chat_template_kwargs": {"enable_thinking": True},
+                },
+            }
+        )
     request = urllib.request.Request(
         f"{LITELLM_BASE_URL}/v1/chat/completions",
         data=json.dumps(payload).encode("utf-8"),
@@ -1502,9 +3209,32 @@ def generate_report(context: str) -> str:
         },
         method="POST",
     )
-    with urllib.request.urlopen(request, timeout=60) as response:
+    with urllib.request.urlopen(request, timeout=GENERATION_TIMEOUT_SECONDS) as response:
         body = json.load(response)
-    return body["choices"][0]["message"]["content"].strip()
+    choice = body.get("choices", [{}])[0] if isinstance(body, dict) else {}
+    message = choice.get("message", {}) if isinstance(choice, dict) else {}
+    content = message.get("content") if isinstance(message, dict) else None
+    response_shape = {
+        "finish_reason": choice.get("finish_reason") if isinstance(choice, dict) else None,
+        "message_keys": sorted(message) if isinstance(message, dict) else [],
+        "content_length": len(content.strip()) if isinstance(content, str) else 0,
+        "reasoning_length": len(
+            message.get("reasoning_content") or message.get("reasoning") or ""
+        ) if isinstance(message, dict) else 0,
+    }
+    if response_shape["finish_reason"] == "length":
+        logger.error("health-summary model exhausted its output budget: response_shape=%s", response_shape)
+        raise ValueError(f"health-summary model exhausted its output budget: {response_shape}")
+    if not isinstance(content, str) or not content.strip():
+        logger.error("health-summary model returned no final content: response_shape=%s", response_shape)
+        raise ValueError(f"health-summary model returned empty content: {response_shape}")
+    content = content.strip()
+    if "</think>" in content:
+        content = content.rsplit("</think>", 1)[1].strip()
+    if not content:
+        logger.error("health-summary model returned no final content after reasoning extraction: response_shape=%s", response_shape)
+        raise ValueError(f"health-summary model returned empty content: {response_shape}")
+    return content
 
 
 def run_once() -> bool:
@@ -1529,12 +3259,15 @@ def run_once() -> bool:
         )
         connection.commit()
 
+    stage = "health_collection"
     try:
         health = collect_health()
         health_context = render_health_context(health)
+        stage = "knowledge_retrieval"
         knowledge = retrieve_knowledge("AICorp architecture and operational guidance for this health state")
         if knowledge:
             health_context += "\n\nRelevant approved knowledge:\n" + knowledge
+        stage = "report_generation"
         report = generate_report(health_context)
         with psycopg.connect(DATABASE_URL) as connection:
             connection.execute(
@@ -1556,6 +3289,7 @@ def run_once() -> bool:
         logger.info("agent run completed: id=%s", run_id)
         return True
     except Exception as error:
+        error_detail = str(error)[:500]
         with psycopg.connect(DATABASE_URL) as connection:
             connection.execute(
                 """
@@ -1563,7 +3297,7 @@ def run_once() -> bool:
                 SET completed_at = %s, status = 'failed', error = %s
                 WHERE id = %s
                 """,
-                (datetime.now(timezone.utc), type(error).__name__, run_id),
+                (datetime.now(timezone.utc), f"{stage}:{type(error).__name__}", run_id),
             )
             record_audit_event(
                 connection,
@@ -1571,10 +3305,20 @@ def run_once() -> bool:
                 "run_failed",
                 AGENT_NAME,
                 subject=str(run_id),
-                details={"error_type": type(error).__name__},
+                details={
+                    "error_type": type(error).__name__,
+                    "stage": stage,
+                    "error": error_detail,
+                },
             )
             connection.commit()
-        logger.error("agent run failed: id=%s error_type=%s", run_id, type(error).__name__)
+        logger.error(
+            "agent run failed: id=%s stage=%s error_type=%s detail=%s",
+            run_id,
+            stage,
+            type(error).__name__,
+            error_detail,
+        )
         return False
 
 
@@ -1612,8 +3356,16 @@ class ReportHandler(BaseHTTPRequestHandler):
         return json.loads(self.rfile.read(length).decode("utf-8"))
 
     def _product_snapshot(self) -> dict:
-        health = collect_health()
+        try:
+            health = collect_health()
+        except (OSError, urllib.error.URLError, urllib.error.HTTPError, TimeoutError, KeyError, TypeError, ValueError):
+            health = {"targets": [], "alerts": []}
         with psycopg.connect(DATABASE_URL) as connection:
+            sync_product_state(connection)
+            devices = device_snapshot(connection)
+            device_alerts = alert_snapshot(connection)
+            notifications = notification_snapshot(connection)
+            discovery_events = discovery_event_count(connection)
             row = connection.execute(
                 """
                 SELECT agent_name, started_at, completed_at, status, report
@@ -1634,6 +3386,7 @@ class ReportHandler(BaseHTTPRequestHandler):
                 "report": row[4],
             }
         return {
+            "version": os.environ.get("AICORP_PRODUCT_VERSION", "unknown"),
             "targets": [
                 {
                     "job": target.get("labels", {}).get("job"),
@@ -1651,16 +3404,21 @@ class ReportHandler(BaseHTTPRequestHandler):
                 }
                 for alert in health["alerts"]
             ],
+            "devices": devices,
+            "discovery_event_count": discovery_events,
+            "device_alerts": device_alerts,
+            "notification_deliveries": notifications,
+            "notification_channel": "teams" if os.environ.get("AICORP_TEAMS_WEBHOOK_URL", "").strip() else "disabled",
             "report": report,
         }
 
     def _product_brief_payload(self, row: tuple) -> dict:
         fields = (
             "id", "agent_name", "schema_version", "requested_by",
-            "approval_request_id", "status", "brief", "backlog",
+            "approval_request_id", "status", "brief", "backlog", "requirements",
             "source_context", "created_at", "updated_at",
         )
-        payload = dict(zip(fields, row))
+        payload: dict[str, object] = dict(zip(fields, row))
         payload["publication_status"] = (
             "published" if payload["status"] == "approved"
             else "completed" if payload["status"] == "completed"
@@ -1760,7 +3518,7 @@ class ReportHandler(BaseHTTPRequestHandler):
                           WHERE brief.status <> 'archived'
                           ORDER BY task.created_at DESC LIMIT %s
                     """,
-                    (1 if self.path.endswith("/latest") else 20,),
+                    (1 if self.path.endswith("/latest") else 50,),
                 ).fetchall()
             fields = ("id", "worker_plan_id", "work_item_id", "requested_by", "start_approval_id", "status", "implementation", "qa_result", "qa_plan_id", "created_at", "updated_at")
             tasks = [dict(zip(fields, row)) for row in rows]
@@ -1873,7 +3631,7 @@ class ReportHandler(BaseHTTPRequestHandler):
                     rows = connection.execute(
                         f"""
                         SELECT id, agent_name, schema_version, requested_by,
-                               approval_request_id, status, brief, backlog,
+                               approval_request_id, status, brief, backlog, requirements,
                                source_context, created_at, updated_at
                         FROM agent_product_briefs
                         {status_filter}
@@ -1889,7 +3647,7 @@ class ReportHandler(BaseHTTPRequestHandler):
                 rows = connection.execute(
                     f"""
                     SELECT id, agent_name, schema_version, requested_by,
-                           approval_request_id, status, brief, backlog,
+                              approval_request_id, status, brief, backlog, requirements,
                            source_context, created_at, updated_at
                     FROM agent_product_briefs
                     {status_filter}
@@ -1900,6 +3658,229 @@ class ReportHandler(BaseHTTPRequestHandler):
             self._json_response(
                 200,
                 {"briefs": [self._product_brief_payload(row) for row in rows]},
+            )
+            return
+
+        if product_brief_route.path.startswith("/product-briefs/") and product_brief_route.path.endswith("/delivery-status"):
+            if not self._authorized():
+                self._json_response(401, {"error": "unauthorized"})
+                return
+            try:
+                brief_id = int(product_brief_route.path.strip("/").split("/")[1])
+            except (IndexError, ValueError):
+                self._json_response(400, {"error": "invalid product brief id"})
+                return
+            with psycopg.connect(DATABASE_URL) as connection:
+                brief_row = connection.execute(
+                    """
+                    SELECT id, status, brief, backlog, requirements, updated_at
+                    FROM agent_product_briefs
+                    WHERE id = %s
+                    """,
+                    (brief_id,),
+                ).fetchone()
+                if brief_row is None:
+                    self._json_response(404, {"error": "product brief not found"})
+                    return
+                technical_rows = connection.execute(
+                    """
+                    SELECT id, status, approval_request_id, created_at, updated_at
+                    FROM agent_technical_plans
+                    WHERE product_brief_id = %s
+                    ORDER BY id
+                    """,
+                    (brief_id,),
+                ).fetchall()
+                engineering_rows = connection.execute(
+                    """
+                    SELECT engineering.id, engineering.technical_plan_id, engineering.status,
+                           engineering.approval_request_id, engineering.created_at, engineering.updated_at
+                    FROM agent_engineering_plans AS engineering
+                    JOIN agent_technical_plans AS technical ON technical.id = engineering.technical_plan_id
+                    WHERE technical.product_brief_id = %s
+                    ORDER BY engineering.id
+                    """,
+                    (brief_id,),
+                ).fetchall()
+                worker_rows = connection.execute(
+                    """
+                    SELECT worker.id, worker.role, worker.engineering_plan_id, worker.status,
+                           worker.approval_request_id, worker.created_at, worker.updated_at
+                    FROM agent_worker_plans AS worker
+                    JOIN agent_engineering_plans AS engineering ON engineering.id = worker.engineering_plan_id
+                    JOIN agent_technical_plans AS technical ON technical.id = engineering.technical_plan_id
+                    WHERE technical.product_brief_id = %s
+                    ORDER BY worker.id
+                    """,
+                    (brief_id,),
+                ).fetchall()
+                task_rows = connection.execute(
+                    """
+                    SELECT task.id, task.work_item_id, task.worker_plan_id, task.qa_plan_id,
+                           task.status, task.implementation, task.qa_result, task.created_at, task.updated_at
+                    FROM agent_execution_tasks AS task
+                    JOIN agent_worker_plans AS worker ON worker.id = task.worker_plan_id
+                    JOIN agent_engineering_plans AS engineering ON engineering.id = worker.engineering_plan_id
+                    JOIN agent_technical_plans AS technical ON technical.id = engineering.technical_plan_id
+                    WHERE technical.product_brief_id = %s
+                    ORDER BY task.id
+                    """,
+                    (brief_id,),
+                ).fetchall()
+                proposal_rows = connection.execute(
+                    """
+                    SELECT proposal.id, proposal.execution_task_id, proposal.worker_plan_id,
+                           proposal.status, proposal.qa_result, proposal.created_at, proposal.updated_at
+                    FROM agent_change_proposals AS proposal
+                    JOIN agent_execution_tasks AS task ON task.id = proposal.execution_task_id
+                    JOIN agent_worker_plans AS worker ON worker.id = task.worker_plan_id
+                    JOIN agent_engineering_plans AS engineering ON engineering.id = worker.engineering_plan_id
+                    JOIN agent_technical_plans AS technical ON technical.id = engineering.technical_plan_id
+                    WHERE technical.product_brief_id = %s
+                    ORDER BY proposal.id
+                    """,
+                    (brief_id,),
+                ).fetchall()
+                deployment_rows = connection.execute(
+                    """
+                    SELECT deployment.approval_id, deployment.proposal_id, deployment.status,
+                           deployment.evidence, deployment.started_at, deployment.completed_at
+                    FROM agent_deployment_runs AS deployment
+                    JOIN agent_change_proposals AS proposal ON proposal.id = deployment.proposal_id
+                    JOIN agent_execution_tasks AS task ON task.id = proposal.execution_task_id
+                    JOIN agent_worker_plans AS worker ON worker.id = task.worker_plan_id
+                    JOIN agent_engineering_plans AS engineering ON engineering.id = worker.engineering_plan_id
+                    JOIN agent_technical_plans AS technical ON technical.id = engineering.technical_plan_id
+                    WHERE technical.product_brief_id = %s
+                    ORDER BY deployment.started_at
+                    """,
+                    (brief_id,),
+                ).fetchall()
+                remediation_rows = connection.execute(
+                    """
+                    SELECT start.context->>'deployment_remediation_for_approval_id',
+                           start.id, task.id, proposal.id, proposal.status,
+                           retry.id, retry.status, start.context
+                    FROM agent_approval_requests AS start
+                    JOIN agent_execution_tasks AS task
+                        ON task.start_approval_id = start.id
+                    JOIN agent_worker_plans AS worker
+                        ON worker.id = task.worker_plan_id
+                    JOIN agent_engineering_plans AS engineering
+                        ON engineering.id = worker.engineering_plan_id
+                    JOIN agent_technical_plans AS technical
+                        ON technical.id = engineering.technical_plan_id
+                    LEFT JOIN agent_change_proposals AS proposal
+                        ON proposal.execution_task_id = task.id
+                    LEFT JOIN agent_approval_requests AS retry
+                        ON retry.action = 'retry_deployment'
+                       AND retry.context->>'source_deployment_approval_id'
+                           = start.context->>'deployment_remediation_for_approval_id'
+                       AND retry.context->>'proposal_id' = proposal.id::text
+                    WHERE start.action = 'start_software_engineer_execution'
+                      AND start.context ? 'deployment_remediation_for_approval_id'
+                      AND technical.product_brief_id = %s
+                    ORDER BY start.id, proposal.id DESC NULLS LAST, retry.id DESC NULLS LAST
+                    """,
+                    (brief_id,),
+                ).fetchall()
+            try:
+                requirement_contract = validate_requirement_contract(brief_row[4], brief_id)
+            except ValueError as error:
+                self._json_response(409, {"error": f"invalid Product Brief requirement contract: {error}"})
+                return
+            remaining_failures = [
+                {
+                    "requirement_id": item["id"],
+                    "acceptance_criterion_id": criterion["id"],
+                    "failure": "acceptance evidence is not passing",
+                }
+                for item in requirement_contract["items"]
+                for criterion in item["acceptance_criteria"]
+                if criterion["status"] != "passed"
+            ]
+            artifacts = {
+                "technical_plans": [
+                    {"id": row[0], "status": row[1], "approval_request_id": row[2], "created_at": row[3], "updated_at": row[4]}
+                    for row in technical_rows
+                ],
+                "engineering_plans": [
+                    {"id": row[0], "technical_plan_id": row[1], "status": row[2], "approval_request_id": row[3], "created_at": row[4], "updated_at": row[5]}
+                    for row in engineering_rows
+                ],
+                "worker_plans": [
+                    {"id": row[0], "role": row[1], "engineering_plan_id": row[2], "status": row[3], "approval_request_id": row[4], "created_at": row[5], "updated_at": row[6]}
+                    for row in worker_rows
+                ],
+                "execution_tasks": [
+                    {"id": row[0], "work_item_id": row[1], "worker_plan_id": row[2], "qa_plan_id": row[3], "status": row[4], "implementation": row[5], "qa_result": row[6], "created_at": row[7], "updated_at": row[8]}
+                    for row in task_rows
+                ],
+                "change_proposals": [
+                    {"id": row[0], "execution_task_id": row[1], "worker_plan_id": row[2], "status": row[3], "qa_result": row[4], "created_at": row[5], "updated_at": row[6]}
+                    for row in proposal_rows
+                ],
+            }
+            deployments = []
+            remediation_by_source: dict[str, dict[str, object]] = {}
+            for row in remediation_rows:
+                source_id, execution_approval_id, execution_task_id, replacement_proposal_id, proposal_status, retry_id, retry_status, context = row
+                if not source_id:
+                    continue
+                remediation_by_source.setdefault(
+                    str(source_id),
+                    {
+                        "responsible_agent": context.get("responsible_agent") if isinstance(context, dict) else SOFTWARE_ENGINEER_NAME,
+                        "responsible_role": context.get("responsible_role") if isinstance(context, dict) else "software_engineer",
+                        "execution_approval_id": execution_approval_id,
+                        "execution_task_id": execution_task_id,
+                        "replacement_proposal_id": replacement_proposal_id,
+                        "replacement_proposal_status": proposal_status,
+                        "retry_approval_id": retry_id,
+                        "retry_status": retry_status,
+                    },
+                )
+            for row in deployment_rows:
+                evidence = row[3] if isinstance(row[3], dict) else {}
+                acceptance = evidence.get("acceptance") if isinstance(evidence.get("acceptance"), dict) else {}
+                if row[2] == "failed":
+                    remaining_failures.append(
+                        {
+                            "deployment_id": row[0],
+                            "proposal_id": row[1],
+                            "failure": evidence.get("message") or evidence.get("error") or "deployment acceptance failed",
+                        }
+                    )
+                deployments.append(
+                    {
+                        "approval_id": row[0],
+                        "proposal_id": row[1],
+                        "status": row[2],
+                        "started_at": row[4],
+                        "completed_at": row[5],
+                        "runtime": evidence.get("runtime", {}),
+                        "acceptance": acceptance,
+                        "checks": evidence.get("checks", []),
+                        "remediation": remediation_by_source.get(str(row[0])),
+                    }
+                )
+            self._json_response(
+                200,
+                {
+                    "product_brief_id": brief_id,
+                    "status": brief_row[1],
+                    "brief": brief_row[2],
+                    "goals": requirement_contract["goals"],
+                    "backlog": brief_row[3],
+                    "requirements": requirement_contract["items"],
+                    "artifacts": artifacts,
+                    "deployments": deployments,
+                    "remediations": list(remediation_by_source.values()),
+                    "remaining_failures": remaining_failures,
+                    "product_complete": not remaining_failures
+                    and all(goal["status"] == "achieved" for goal in requirement_contract["goals"]),
+                    "updated_at": brief_row[5],
+                },
             )
             return
 
@@ -1916,7 +3897,7 @@ class ReportHandler(BaseHTTPRequestHandler):
                 row = connection.execute(
                     """
                     SELECT id, agent_name, schema_version, requested_by,
-                           approval_request_id, status, brief, backlog,
+                              approval_request_id, status, brief, backlog, requirements,
                            source_context, created_at, updated_at
                     FROM agent_product_briefs
                     WHERE id = %s
@@ -2004,6 +3985,23 @@ class ReportHandler(BaseHTTPRequestHandler):
                 self._json_response(503, {"error": "product data unavailable"})
             return
 
+        if self.path == "/devices":
+            try:
+                with psycopg.connect(DATABASE_URL) as connection:
+                    sync_product_state(connection)
+                    self._json_response(
+                        200,
+                        {
+                            "devices": device_snapshot(connection),
+                            "discovery_event_count": discovery_event_count(connection),
+                            "alerts": alert_snapshot(connection),
+                            "notification_deliveries": notification_snapshot(connection),
+                        },
+                    )
+            except (OSError, psycopg.Error, KeyError, TypeError, ValueError):
+                self._json_response(503, {"error": "device data unavailable"})
+            return
+
         if self.path == "/health":
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -2012,7 +4010,6 @@ class ReportHandler(BaseHTTPRequestHandler):
             return
 
         if self.path == "/metrics":
-            init_database()
             with psycopg.connect(DATABASE_URL) as connection:
                 run = connection.execute(
                     """
@@ -2068,7 +4065,6 @@ class ReportHandler(BaseHTTPRequestHandler):
 
         if self.path == "/report":
             with psycopg.connect(DATABASE_URL) as connection:
-                init_database()
                 row = connection.execute(
                     """
                     SELECT agent_name, started_at, completed_at, status, report
@@ -2117,12 +4113,20 @@ class ReportHandler(BaseHTTPRequestHandler):
             self._json_response(200, {"events": [dict(zip(fields, row)) for row in rows]})
             return
 
+        if self.path == "/planning-reset/preview":
+            if not self._authorized():
+                self._json_response(401, {"error": "unauthorized"})
+                return
+            with psycopg.connect(DATABASE_URL) as connection:
+                scope = planning_reset_scope(connection)
+            self._json_response(200, {"reset": scope, "confirmation_phrase": PLANNING_RESET_CONFIRMATION})
+            return
+
         if self.path == "/approval-requests" and self.command == "GET":
             if not self._authorized():
                 self._json_response(401, {"error": "unauthorized"})
                 return
             with psycopg.connect(DATABASE_URL) as connection:
-                init_governance_tables(connection)
                 expire_pending_approvals(connection, AGENT_NAME)
                 rows = connection.execute(
                     """
@@ -2143,6 +4147,96 @@ class ReportHandler(BaseHTTPRequestHandler):
         self.send_error(404)
 
     def do_POST(self) -> None:
+        if self.path in {"/devices/discovery", "/devices/heartbeat"}:
+            if not self._authorized():
+                self._json_response(401, {"error": "unauthorized"})
+                return
+            try:
+                payload = self._request_json()
+                event = {
+                    **payload,
+                    "event_type": "heartbeat" if self.path.endswith("heartbeat") else "device_discovered",
+                    "source": str(payload.get("source", "device-discovery-api")).strip(),
+                }
+                with psycopg.connect(DATABASE_URL) as connection:
+                    device = record_discovery_event(connection, event)
+                    transitions = evaluate_alerts(connection)
+                    for transition in transitions:
+                        record_audit_event(
+                            connection,
+                            AGENT_NAME,
+                            f"product_alert_{transition['state']}",
+                            AGENT_NAME,
+                            str(transition["device_id"]),
+                            transition,
+                        )
+                    connection.commit()
+                self._json_response(200, {"device": device, "alerts": transitions})
+            except (KeyError, ValueError, TypeError, psycopg.Error) as error:
+                self._json_response(400, {"error": str(error)})
+            return
+
+        if self.path == "/planning-reset/request":
+            actor = self._authenticated_actor()
+            if actor is None:
+                self._json_response(401, {"error": "unauthorized"})
+                return
+            if actor[0] != "human":
+                self._json_response(403, {"error": "only the authenticated operator can request a planning reset"})
+                return
+            try:
+                payload = self._request_json()
+                reason = str(payload.get("reason", "")).strip()
+                confirmation = str(payload.get("confirmation", "")).strip()
+                confirmed = planning_reset_confirmed(payload)
+                if not reason:
+                    raise ValueError("reason is required")
+                if not confirmed:
+                    raise ValueError(
+                        "planning reset requires confirm=true or the exact confirmation phrase "
+                        f"{PLANNING_RESET_CONFIRMATION}"
+                    )
+                with psycopg.connect(DATABASE_URL) as connection:
+                    scope = planning_reset_scope(connection)
+                    context = {
+                        "reason": reason,
+                        "confirm": True,
+                        "confirmation": PLANNING_RESET_CONFIRMATION,
+                        "scope": scope,
+                    }
+                    request_id = create_approval_request(
+                        connection,
+                        AGENT_NAME,
+                        "reset_planning_workspace",
+                        actor[1],
+                        reason,
+                        context,
+                    )
+                    record_audit_event(
+                        connection,
+                        AGENT_NAME,
+                        "approval_requested",
+                        actor[1],
+                        str(request_id),
+                        {"action": "reset_planning_workspace", "scope": scope},
+                    )
+                    connection.commit()
+                self._json_response(
+                    202,
+                    {
+                        "id": request_id,
+                        "status": "pending",
+                        "action": "reset_planning_workspace",
+                        "planning_generation": scope["planning_generation"],
+                        "reset": scope,
+                    },
+                )
+            except (KeyError, ValueError, TypeError) as error:
+                self._json_response(400, {"error": str(error)})
+            except PlanningResetConflict as error:
+                self._json_response(409, {"error": str(error)})
+            return
+
         if self.path == "/approval-requests":
             if not self._authorized():
                 self._json_response(401, {"error": "unauthorized"})
@@ -2153,6 +4247,12 @@ class ReportHandler(BaseHTTPRequestHandler):
                 requested_by = str(payload["requested_by"]).strip()
                 reason = str(payload["reason"])
                 context = payload.get("context") if isinstance(payload.get("context"), dict) else {}
+                if action == DEPLOYMENT_RETRY_ACTION:
+                    self._json_response(400, {"error": "use /deployment-runs/{approval_id}/retry to request a governed deployment retry"})
+                    return
+                if action == "reset_planning_workspace":
+                    self._json_response(400, {"error": "use /planning-reset/request with explicit confirmation"})
+                    return
                 if action in AUTOMATED_HANDOFF_ACTIONS:
                     request_id = auto_approve_handoff(action, requested_by, reason, context)
                     task_id = None
@@ -2170,7 +4270,6 @@ class ReportHandler(BaseHTTPRequestHandler):
                     self._json_response(201, response)
                     return
                 with psycopg.connect(DATABASE_URL) as connection:
-                    init_governance_tables(connection)
                     expire_pending_approvals(connection, AGENT_NAME)
                     request_id = create_approval_request(
                         connection, AGENT_NAME, action, requested_by, reason, context,
@@ -2183,6 +4282,8 @@ class ReportHandler(BaseHTTPRequestHandler):
                 self._json_response(201, {"id": request_id, "status": "pending"})
             except (KeyError, ValueError, TypeError) as error:
                 self._json_response(400, {"error": str(error)})
+            except PlanningResetConflict as error:
+                self._json_response(409, {"error": str(error)})
             return
 
         if self.path.startswith("/approval-requests/") and self.path.endswith("/retry"):
@@ -2203,6 +4304,10 @@ class ReportHandler(BaseHTTPRequestHandler):
                 if request_row[5] != "approved" or request_row[2] not in AUTO_DISPATCH_ACTIONS:
                     self._json_response(409, {"error": "only an approved automatic generation request can be retried"})
                     return
+                with psycopg.connect(DATABASE_URL) as connection:
+                    if not planning_generation_matches(connection, request_row[10] or {}):
+                        self._json_response(409, {"error": "planning reset invalidated this generation request"})
+                        return
                 threading.Thread(
                     target=dispatch_approved_action,
                     args=(request_row[2], request_id),
@@ -2211,6 +4316,71 @@ class ReportHandler(BaseHTTPRequestHandler):
                 self._json_response(202, {"id": request_id, "status": "retrying", "action": request_row[2]})
             except (ValueError, KeyError, TypeError) as error:
                 self._json_response(400, {"error": str(error)})
+            return
+
+        if self.path == "/deployment-failures/remediate":
+            if not self._authorized():
+                self._json_response(401, {"error": "unauthorized"})
+                return
+            try:
+                payload = self._request_json()
+                source_approval_id = int(payload["source_deployment_approval_id"])
+                source_proposal_id = int(payload["source_proposal_id"])
+                result = queue_deployment_remediation(source_approval_id, source_proposal_id)
+                self._json_response(202, result)
+            except (KeyError, ValueError, TypeError) as error:
+                self._json_response(400, {"error": str(error)})
+            except DeploymentRemediationConflict as error:
+                self._json_response(409, {"error": str(error)})
+            return
+
+        if self.path.startswith("/deployment-runs/") and self.path.endswith("/break-retry-loop"):
+            actor = self._authenticated_actor()
+            if actor is None or actor[0] != "human":
+                self._json_response(403, {"error": "only the authenticated operator can break a deployment retry loop"})
+                return
+            try:
+                source_approval_id = int(self.path.split("/")[2])
+                payload = self._request_json()
+                reason = str(payload.get("reason", "")).strip()
+                result = break_deployment_retry_loop(source_approval_id, actor[1], reason)
+                self._json_response(200, result)
+            except (KeyError, ValueError, TypeError) as error:
+                self._json_response(400, {"error": str(error)})
+            except DeploymentRemediationConflict as error:
+                self._json_response(409, {"error": str(error)})
+            return
+
+        if self.path.startswith("/deployment-runs/") and self.path.endswith("/retry"):
+            actor = self._authenticated_actor()
+            if actor is None or actor[0] != "human":
+                self._json_response(403, {"error": "only the authenticated operator can request a deployment retry"})
+                return
+            try:
+                source_approval_id = int(self.path.split("/")[2])
+                payload = self._request_json()
+                reason = str(payload.get("reason", "")).strip()
+                with psycopg.connect(DATABASE_URL) as connection:
+                    request_id = create_deployment_retry_approval(
+                        connection,
+                        actor[1],
+                        source_approval_id,
+                        reason,
+                    )
+                self._json_response(
+                    201,
+                    {
+                        "id": request_id,
+                        "status": "approved",
+                        "action": DEPLOYMENT_RETRY_ACTION,
+                        "source_deployment_approval_id": source_approval_id,
+                        "automated": True,
+                    },
+                )
+            except (KeyError, ValueError, TypeError) as error:
+                self._json_response(400, {"error": str(error)})
+            except DeploymentRetryConflict as error:
+                self._json_response(409, {"error": str(error)})
             return
 
         if self.path.startswith("/approval-requests/"):
@@ -2224,7 +4394,6 @@ class ReportHandler(BaseHTTPRequestHandler):
                 requested_decided_by = str(payload.get("decided_by", "")).strip()
                 decision_reason = str(payload["decision_reason"])
                 with psycopg.connect(DATABASE_URL) as connection:
-                    init_governance_tables(connection)
                     expire_pending_approvals(connection, AGENT_NAME)
                     actor = self._authenticated_actor()
                     request_row = get_approval_request(connection, request_id)
@@ -2260,6 +4429,9 @@ class ReportHandler(BaseHTTPRequestHandler):
                     archive_reason = ""
                     archive_cancelled_ids = []
                     amendment_plan_id = None
+                    reset_planning = False
+                    reset_reason = ""
+                    reset_result = None
                     if status == "approved" and request_row[2] == "approve_product_brief":
                         context = request_row[10] or {}
                         try:
@@ -2282,7 +4454,7 @@ class ReportHandler(BaseHTTPRequestHandler):
                         except (KeyError, TypeError, ValueError):
                             self._json_response(400, {"error": "archive_product_brief requires product_brief_id and reason"})
                             return
-                        if context.get("confirm") is not True:
+                        if not planning_reset_confirmed(context):
                             pending_publication = connection.execute(
                                 """
                                 SELECT 1 FROM agent_approval_requests
@@ -2305,6 +4477,19 @@ class ReportHandler(BaseHTTPRequestHandler):
                         if brief[0] == "archived":
                             self._json_response(409, {"error": "product brief is already archived"})
                             return
+                    if status == "approved" and request_row[2] == "reset_planning_workspace":
+                        if actor[0] != "human":
+                            self._json_response(403, {"error": "only the authenticated operator can approve a planning reset"})
+                            return
+                        context = request_row[10] or {}
+                        reset_reason = str(context.get("reason", request_row[4])).strip()
+                        if context.get("confirm") is not True:
+                            self._json_response(409, {"error": "planning reset approval requires explicit confirmation"})
+                            return
+                        if not planning_generation_matches(connection, context):
+                            self._json_response(409, {"error": "planning reset approval belongs to an obsolete planning generation"})
+                            return
+                        reset_planning = True
                     if status == "approved" and request_row[2] == "approve_technical_plan":
                         context = request_row[10] or {}
                         if context.get("revision_type") == "amendment":
@@ -2320,15 +4505,18 @@ class ReportHandler(BaseHTTPRequestHandler):
                             if plan is None or plan[0] != "draft":
                                 self._json_response(409, {"error": "the referenced technical-plan amendment must be a draft"})
                                 return
-                    if archive_brief_id is not None:
-                        connection.execute(
+                    if archive_brief_id is not None or reset_planning:
+                        updated = connection.execute(
                             """
                             UPDATE agent_approval_requests
                             SET status = %s, decided_by = %s, decision_reason = %s, decided_at = %s
                             WHERE id = %s AND status = 'pending'
+                            RETURNING id
                             """,
                             (status, decided_by, decision_reason, datetime.now(timezone.utc), request_id),
-                        )
+                        ).fetchone()
+                        if updated is None:
+                            raise PlanningResetConflict("approval request is missing or no longer pending")
                     else:
                         decide_approval(connection, request_id, status, decided_by, decision_reason)
                     record_audit_event(
@@ -2341,7 +4529,15 @@ class ReportHandler(BaseHTTPRequestHandler):
                             archive_brief_id,
                             decided_by,
                             archive_reason,
+                            planning_reset_confirmed(context),
+                        )
+                    if reset_planning:
+                        reset_result = reset_planning_workspace_in_connection(
+                            connection,
+                            decided_by,
+                            reset_reason,
                             context.get("confirm") is True,
+                            request_id,
                         )
                     if publication_brief_id is not None:
                         connection.execute(
@@ -2380,7 +4576,7 @@ class ReportHandler(BaseHTTPRequestHandler):
                         CTO_NAME,
                         {"technical_plan_id": amendment_plan_id},
                     )
-                if status == "approved" and amendment_plan_id is None and archive_brief_id is None:
+                if status == "approved" and amendment_plan_id is None and archive_brief_id is None and not reset_planning:
                     threading.Thread(
                         target=dispatch_approved_action,
                         args=(request_row[2], request_id),
@@ -2394,7 +4590,11 @@ class ReportHandler(BaseHTTPRequestHandler):
                 if archive_brief_id is not None:
                     response["archived_product_brief_id"] = archive_brief_id
                     response["cancelled_publication_approval_ids"] = archive_cancelled_ids
+                if reset_result is not None:
+                    response["planning_reset"] = reset_result
                 self._json_response(200, response)
+            except PlanningResetConflict as error:
+                self._json_response(409, {"error": str(error)})
             except (ValueError, KeyError, TypeError) as error:
                 self._json_response(400, {"error": str(error)})
             return
@@ -2414,7 +4614,10 @@ class ReportHandler(BaseHTTPRequestHandler):
                     if not approved_action(connection, approval_id, "submit_repository_change_proposal"):
                         self._json_response(403, {"error": "approved submit_repository_change_proposal request required"})
                         return
-                    task = connection.execute("SELECT status FROM agent_execution_tasks WHERE id = %s", (task_id,)).fetchone()
+                    task = connection.execute(
+                        "SELECT status, work_item_id, worker_plan_id, requirement_contract FROM agent_execution_tasks WHERE id = %s",
+                        (task_id,),
+                    ).fetchone()
                     worker = connection.execute("SELECT role, status FROM agent_worker_plans WHERE id = %s", (worker_plan_id,)).fetchone()
                     if task is None or task[0] != "qa_passed":
                         self._json_response(409, {"error": "execution task must be qa_passed"})
@@ -2422,14 +4625,22 @@ class ReportHandler(BaseHTTPRequestHandler):
                     if worker is None or worker[0] != "software_engineer" or worker[1] != "approved":
                         self._json_response(409, {"error": "approved software_engineer worker plan required"})
                         return
+                    if int(task[2]) != worker_plan_id:
+                        self._json_response(409, {"error": "execution task and worker plan must match"})
+                        return
+                    requirement_contract = validate_requirement_contract(task[3])
+                    proposal["requirement_contract"] = requirement_contract
+                    if not workstream_dependencies_completed(connection, worker_plan_id, str(task[1])):
+                        self._json_response(409, {"error": "predecessor workstreams must be deployed first"})
+                        return
                     now = datetime.now(timezone.utc)
                     row = connection.execute(
                         """
                         INSERT INTO agent_change_proposals
-                            (execution_task_id, worker_plan_id, requested_by, proposal, created_at, updated_at)
-                        VALUES (%s, %s, %s, %s::jsonb, %s, %s) RETURNING id
+                            (execution_task_id, worker_plan_id, requested_by, proposal, requirement_contract, created_at, updated_at)
+                        VALUES (%s, %s, %s, %s::jsonb, %s::jsonb, %s, %s) RETURNING id
                         """,
-                        (task_id, worker_plan_id, requested_by, json.dumps(proposal), now, now),
+                        (task_id, worker_plan_id, requested_by, json.dumps(proposal), json.dumps(requirement_contract), now, now),
                     ).fetchone()
                     record_audit_event(connection, EXECUTION_AGENT_NAME, "repository_change_proposed", requested_by, str(row[0]), {"task_id": task_id, "approval_id": approval_id})
                     connection.commit()
@@ -2452,8 +4663,31 @@ class ReportHandler(BaseHTTPRequestHandler):
                     if not approved_action(connection, approval_id, "review_repository_change"):
                         self._json_response(403, {"error": "approved review_repository_change request required"})
                         return
-                    qa_plan = connection.execute("SELECT role, status FROM agent_worker_plans WHERE id = %s", (qa_plan_id,)).fetchone()
-                    if qa_plan is None or qa_plan[0] != "qa_engineer" or qa_plan[1] != "approved":
+                    approval = get_approval_request(connection, approval_id)
+                    approval_context = approval[10] if approval else {}
+                    if (
+                        approval is None
+                        or str(approval_context.get("proposal_id")) != str(proposal_id)
+                        or str(approval_context.get("qa_plan_id")) != str(qa_plan_id)
+                    ):
+                        self._json_response(409, {"error": "QA approval context does not match this proposal"})
+                        return
+                    qa_plan = connection.execute(
+                        """
+                        SELECT qa.role, qa.status, qa.engineering_plan_id, worker.engineering_plan_id
+                        FROM agent_change_proposals AS proposal
+                        JOIN agent_worker_plans AS worker ON worker.id = proposal.worker_plan_id
+                        JOIN agent_worker_plans AS qa ON qa.id = %s
+                        WHERE proposal.id = %s
+                        """,
+                        (qa_plan_id, proposal_id),
+                    ).fetchone()
+                    if (
+                        qa_plan is None
+                        or qa_plan[0] != "qa_engineer"
+                        or qa_plan[1] != "approved"
+                        or qa_plan[2] != qa_plan[3]
+                    ):
                         self._json_response(409, {"error": "approved qa_engineer worker plan required"})
                         return
                     status = "qa_passed" if qa_result["result"] == "passed" else "qa_failed"
@@ -2499,6 +4733,23 @@ class ReportHandler(BaseHTTPRequestHandler):
                     if updated is None:
                         self._json_response(409, {"error": "only an approved proposal can be superseded"})
                         return
+                    cancelled_approvals = connection.execute(
+                        """
+                        UPDATE agent_approval_requests
+                        SET status = 'cancelled', decided_by = %s,
+                            decision_reason = %s, decided_at = %s
+                        WHERE action IN ('deploy', 'retry_deployment')
+                          AND status IN ('pending', 'approved')
+                          AND context->>'proposal_id' = %s
+                        RETURNING id
+                        """,
+                        (
+                            actor[1],
+                            f"Deployment approval cancelled because proposal {proposal_id} was superseded.",
+                            datetime.now(timezone.utc),
+                            str(proposal_id),
+                        ),
+                    ).fetchall()
                     record_audit_event(
                         connection,
                         EXECUTION_AGENT_NAME,
@@ -2507,8 +4758,24 @@ class ReportHandler(BaseHTTPRequestHandler):
                         str(proposal_id),
                         {"reason": reason},
                     )
+                    for (approval_id,) in cancelled_approvals:
+                        record_audit_event(
+                            connection,
+                            EXECUTION_AGENT_NAME,
+                            "deployment_approval_cancelled",
+                            actor[1],
+                            str(approval_id),
+                            {"proposal_id": proposal_id, "reason": reason},
+                        )
                     connection.commit()
-                self._json_response(200, {"id": proposal_id, "status": "superseded"})
+                self._json_response(
+                    200,
+                    {
+                        "id": proposal_id,
+                        "status": "superseded",
+                        "cancelled_deployment_approval_ids": [int(row[0]) for row in cancelled_approvals],
+                    },
+                )
             except (KeyError, ValueError, TypeError) as error:
                 self._json_response(400, {"error": str(error)})
             return
@@ -2529,21 +4796,14 @@ class ReportHandler(BaseHTTPRequestHandler):
                     if not approved_action(connection, approval_id, "approve_repository_change"):
                         self._json_response(403, {"error": "approved approve_repository_change request required"})
                         return
-                    updated = connection.execute(
-                        "UPDATE agent_change_proposals SET status = 'approved', updated_at = %s WHERE id = %s AND status = 'qa_passed' RETURNING id",
-                        (datetime.now(timezone.utc), proposal_id),
+                    proposal = connection.execute(
+                        "SELECT status FROM agent_change_proposals WHERE id = %s",
+                        (proposal_id,),
                     ).fetchone()
-                    if updated is None:
+                    if proposal is None or proposal[0] != "qa_passed":
                         self._json_response(409, {"error": "change proposal must pass QA before approval"})
                         return
-                    record_audit_event(connection, EXECUTION_AGENT_NAME, "repository_change_approved", str(payload.get("decided_by", "operator")), str(proposal_id), {"approval_id": approval_id})
-                    connection.commit()
-                create_pending_approval(
-                    "deploy",
-                    QA_ENGINEER_NAME,
-                    f"Final deployment approval for QA-approved repository proposal {proposal_id}.",
-                    {"proposal_id": proposal_id},
-                )
+                approve_repository_change_automatically(proposal_id)
                 self._json_response(200, {"id": proposal_id, "status": "approved"})
             except (KeyError, ValueError, TypeError) as error:
                 self._json_response(400, {"error": str(error)})
@@ -2561,18 +4821,24 @@ class ReportHandler(BaseHTTPRequestHandler):
                 requested_by = str(payload.get("requested_by", "operator")).strip()
                 if not work_item_id or not requested_by:
                     raise ValueError("work_item_id and requested_by are required")
-                init_database()
                 with psycopg.connect(DATABASE_URL) as connection:
                     if not approved_action(connection, approval_id, "start_software_engineer_execution"):
                         self._json_response(403, {"error": "approved start_software_engineer_execution request required"})
                         return
+                    require_current_planning_approval(
+                        connection,
+                        approval_id,
+                        "start_software_engineer_execution",
+                        lock_state=True,
+                    )
                     worker = connection.execute(
-                        "SELECT role, status FROM agent_worker_plans WHERE id = %s",
+                        "SELECT role, status, plan FROM agent_worker_plans WHERE id = %s",
                         (worker_plan_id,),
                     ).fetchone()
                     if worker is None or worker[0] != "software_engineer" or worker[1] != "approved":
                         self._json_response(409, {"error": "an approved software_engineer worker plan is required"})
                         return
+                    requirement_contract = validate_requirement_contract(worker[2].get("requirement_contract"))
                     used = connection.execute(
                         "SELECT 1 FROM agent_execution_tasks WHERE start_approval_id = %s",
                         (approval_id,),
@@ -2584,17 +4850,19 @@ class ReportHandler(BaseHTTPRequestHandler):
                     row = connection.execute(
                         """
                         INSERT INTO agent_execution_tasks
-                            (worker_plan_id, work_item_id, requested_by, start_approval_id, status, created_at, updated_at)
-                        VALUES (%s, %s, %s, %s, 'in_progress', %s, %s)
+                            (worker_plan_id, work_item_id, requested_by, start_approval_id, status, requirement_contract, created_at, updated_at)
+                        VALUES (%s, %s, %s, %s, 'in_progress', %s::jsonb, %s, %s)
                         RETURNING id
                         """,
-                        (worker_plan_id, work_item_id, requested_by, approval_id, now, now),
+                        (worker_plan_id, work_item_id, requested_by, approval_id, json.dumps(requirement_contract), now, now),
                     ).fetchone()
                     record_audit_event(connection, EXECUTION_AGENT_NAME, "execution_started", requested_by, str(row[0]), {"worker_plan_id": worker_plan_id, "work_item_id": work_item_id, "approval_id": approval_id})
                     connection.commit()
                 self._json_response(201, {"id": row[0], "status": "in_progress"})
             except (KeyError, ValueError, TypeError) as error:
                 self._json_response(400, {"error": str(error)})
+            except PlanningResetConflict as error:
+                self._json_response(409, {"error": str(error)})
             return
 
         if self.path.startswith("/execution-tasks/") and self.path.endswith("/submit"):
@@ -2610,6 +4878,17 @@ class ReportHandler(BaseHTTPRequestHandler):
                     if not approved_action(connection, approval_id, "submit_software_engineer_execution"):
                         self._json_response(403, {"error": "approved submit_software_engineer_execution request required"})
                         return
+                    task_contract_row = connection.execute(
+                        "SELECT requirement_contract FROM agent_execution_tasks WHERE id = %s",
+                        (task_id,),
+                    ).fetchone()
+                    if task_contract_row is None:
+                        self._json_response(404, {"error": "execution task not found"})
+                        return
+                    task_contract = validate_requirement_contract(task_contract_row[0])
+                    if implementation.get("requirement_contract") is not None:
+                        require_complete_requirement_contract(implementation, task_contract)
+                    implementation["requirement_contract"] = task_contract
                     updated = connection.execute(
                         """
                         UPDATE agent_execution_tasks
@@ -2625,20 +4904,26 @@ class ReportHandler(BaseHTTPRequestHandler):
                     record_audit_event(connection, EXECUTION_AGENT_NAME, "implementation_submitted", "software_engineer", str(task_id), {"approval_id": approval_id})
                     connection.commit()
                 with psycopg.connect(DATABASE_URL) as connection:
-                    qa_plan = connection.execute(
+                    engineering_plan = connection.execute(
                         """
-                        SELECT id FROM agent_worker_plans
-                        WHERE role = 'qa_engineer' AND status = 'approved'
-                        ORDER BY updated_at DESC, id DESC
-                        LIMIT 1
-                        """
+                        SELECT worker.engineering_plan_id
+                        FROM agent_execution_tasks AS task
+                        JOIN agent_worker_plans AS worker ON worker.id = task.worker_plan_id
+                        WHERE task.id = %s
+                        """,
+                        (task_id,),
                     ).fetchone()
-                if qa_plan is None:
+                    qa_plan_id = (
+                        approved_qa_plan_for_engineering(connection, int(engineering_plan[0]))
+                        if engineering_plan
+                        else None
+                    )
+                if qa_plan_id is None:
                     raise ValueError("an approved qa_engineer worker plan is required for automatic QA handoff")
                 queue_automated_handoff(
                     "record_qa_validation",
                     QA_ENGINEER_NAME,
-                    {"task_id": task_id, "qa_plan_id": qa_plan[0]},
+                    {"task_id": task_id, "qa_plan_id": qa_plan_id},
                 )
                 self._json_response(200, {"id": task_id, "status": "submitted"})
             except (KeyError, ValueError, TypeError) as error:
@@ -2659,8 +4944,31 @@ class ReportHandler(BaseHTTPRequestHandler):
                     if not approved_action(connection, approval_id, "record_qa_validation"):
                         self._json_response(403, {"error": "approved record_qa_validation request required"})
                         return
-                    qa_plan = connection.execute("SELECT role, status FROM agent_worker_plans WHERE id = %s", (qa_plan_id,)).fetchone()
-                    if qa_plan is None or qa_plan[0] != "qa_engineer" or qa_plan[1] != "approved":
+                    approval = get_approval_request(connection, approval_id)
+                    approval_context = approval[10] if approval else {}
+                    if (
+                        approval is None
+                        or str(approval_context.get("task_id")) != str(task_id)
+                        or str(approval_context.get("qa_plan_id")) != str(qa_plan_id)
+                    ):
+                        self._json_response(409, {"error": "QA approval context does not match this execution task"})
+                        return
+                    qa_plan = connection.execute(
+                        """
+                        SELECT qa.role, qa.status, qa.engineering_plan_id, worker.engineering_plan_id
+                        FROM agent_execution_tasks AS task
+                        JOIN agent_worker_plans AS worker ON worker.id = task.worker_plan_id
+                        JOIN agent_worker_plans AS qa ON qa.id = %s
+                        WHERE task.id = %s
+                        """,
+                        (qa_plan_id, task_id),
+                    ).fetchone()
+                    if (
+                        qa_plan is None
+                        or qa_plan[0] != "qa_engineer"
+                        or qa_plan[1] != "approved"
+                        or qa_plan[2] != qa_plan[3]
+                    ):
                         self._json_response(409, {"error": "an approved qa_engineer worker plan is required"})
                         return
                     status = "qa_passed" if qa_result["result"] == "passed" else "qa_failed"
@@ -2692,7 +5000,6 @@ class ReportHandler(BaseHTTPRequestHandler):
                 approval_id = int(payload["approval_id"])
                 technical_plan_id = int(payload["technical_plan_id"])
                 requested_by = str(payload.get("requested_by", "operator")).strip()
-                init_database()
                 with psycopg.connect(DATABASE_URL) as connection:
                     if not approved_action(connection, approval_id, "generate_engineering_plan"):
                         self._json_response(403, {"error": "approved generate_engineering_plan request required"})
@@ -2702,39 +5009,80 @@ class ReportHandler(BaseHTTPRequestHandler):
                         (technical_plan_id,),
                     ).fetchone()
                     used = connection.execute(
-                        "SELECT 1 FROM agent_engineering_plans WHERE approval_request_id = %s",
+                        "SELECT id, status FROM agent_engineering_plans WHERE approval_request_id = %s",
                         (approval_id,),
                     ).fetchone()
                     if source is None or source[0] != "approved":
                         self._json_response(409, {"error": "an approved technical plan is required"})
                         return
+                    requirement_contract = validate_requirement_contract(source[1].get("requirement_contract"))
                     if used:
-                        self._json_response(409, {"error": "approval request already generated an engineering plan"})
+                        self._json_response(
+                            200,
+                            {"id": int(used[0]), "status": used[1], "schema_version": "1.0"},
+                        )
                         return
                     record_audit_event(connection, ENGINEERING_MANAGER_NAME, "approved_action_started", requested_by, str(approval_id), {"action": "generate_engineering_plan", "technical_plan_id": technical_plan_id})
                     connection.commit()
-                plan = generate_engineering_plan(LITELLM_BASE_URL, LITELLM_MASTER_KEY, ENGINEERING_MANAGER_MODEL, source[1])
+                plan = attach_requirement_contract(
+                    generate_engineering_plan(LITELLM_BASE_URL, LITELLM_MASTER_KEY, ENGINEERING_MANAGER_MODEL, source[1]),
+                    requirement_contract,
+                )
                 now = datetime.now(timezone.utc)
                 with psycopg.connect(DATABASE_URL) as connection:
+                    require_current_planning_approval(
+                        connection,
+                        approval_id,
+                        "generate_engineering_plan",
+                        lock_state=True,
+                    )
                     row = connection.execute(
                         """
                         INSERT INTO agent_engineering_plans
                             (agent_name, schema_version, technical_plan_id, requested_by,
                              approval_request_id, status, plan, created_at, updated_at)
                         VALUES (%s, '1.0', %s, %s, %s, 'draft', %s::jsonb, %s, %s)
+                        ON CONFLICT (approval_request_id) DO NOTHING
                         RETURNING id
                         """,
                         (ENGINEERING_MANAGER_NAME, technical_plan_id, requested_by, approval_id, json.dumps(plan), now, now),
                     ).fetchone()
-                    record_audit_event(connection, ENGINEERING_MANAGER_NAME, "engineering_plan_generated", ENGINEERING_MANAGER_NAME, str(row[0]), {"approval_id": approval_id, "technical_plan_id": technical_plan_id})
+                    if row is None:
+                        existing = connection.execute(
+                            "SELECT id, status FROM agent_engineering_plans WHERE approval_request_id = %s",
+                            (approval_id,),
+                        ).fetchone()
+                        if existing is None:
+                            raise RuntimeError("engineering plan insert returned no artifact")
+                        plan_id = int(existing[0])
+                        plan_status = existing[1]
+                        created = False
+                    else:
+                        plan_id = int(row[0])
+                        plan_status = "draft"
+                        created = True
+                        record_audit_event(
+                            connection,
+                            ENGINEERING_MANAGER_NAME,
+                            "engineering_plan_generated",
+                            ENGINEERING_MANAGER_NAME,
+                            str(plan_id),
+                            {"approval_id": approval_id, "technical_plan_id": technical_plan_id},
+                        )
                     connection.commit()
-                queue_automated_handoff(
-                    "approve_engineering_plan", ENGINEERING_MANAGER_NAME,
-                    {"engineering_plan_id": row[0]},
+                if created:
+                    queue_automated_handoff(
+                        "approve_engineering_plan", ENGINEERING_MANAGER_NAME,
+                        {"engineering_plan_id": plan_id},
+                    )
+                self._json_response(
+                    201 if created else 200,
+                    {"id": plan_id, "status": plan_status, "schema_version": "1.0"},
                 )
-                self._json_response(201, {"id": row[0], "status": "draft", "schema_version": "1.0"})
             except (KeyError, ValueError, TypeError, json.JSONDecodeError) as error:
                 self._json_response(400, {"error": str(error)})
+            except PlanningResetConflict as error:
+                self._json_response(409, {"error": str(error)})
             except Exception as error:
                 logger.exception("engineering plan generation failed")
                 self._json_response(502, {"error": type(error).__name__})
@@ -2757,7 +5105,6 @@ class ReportHandler(BaseHTTPRequestHandler):
                 if role not in role_config:
                     raise ValueError("role must be software_engineer or qa_engineer")
                 agent_name, action = role_config[role]
-                init_database()
                 with psycopg.connect(DATABASE_URL) as connection:
                     if not approved_action(connection, approval_id, action):
                         self._json_response(403, {"error": f"approved {action} request required"})
@@ -2767,40 +5114,96 @@ class ReportHandler(BaseHTTPRequestHandler):
                         (engineering_plan_id,),
                     ).fetchone()
                     used = connection.execute(
-                        "SELECT 1 FROM agent_worker_plans WHERE approval_request_id = %s",
+                        "SELECT id, status, role FROM agent_worker_plans WHERE approval_request_id = %s",
                         (approval_id,),
                     ).fetchone()
                     if source is None or source[0] != "approved":
                         self._json_response(409, {"error": "an approved engineering plan is required"})
                         return
+                    requirement_contract = validate_requirement_contract(source[1].get("requirement_contract"))
                     if used:
-                        self._json_response(409, {"error": "approval request already generated a worker plan"})
+                        if used[2] != role:
+                            self._json_response(409, {"error": "approval request belongs to another worker role"})
+                            return
+                        self._json_response(
+                            200,
+                            {"id": int(used[0]), "status": used[1], "role": role, "schema_version": "1.0"},
+                        )
                         return
                     record_audit_event(connection, agent_name, "approved_action_started", requested_by, str(approval_id), {"action": action, "engineering_plan_id": engineering_plan_id})
                     connection.commit()
-                plan = generate_worker_plan(LITELLM_BASE_URL, LITELLM_MASTER_KEY, WORKER_MODEL, role, source[1])
+                plan = attach_requirement_contract(
+                    generate_worker_plan(LITELLM_BASE_URL, LITELLM_MASTER_KEY, WORKER_MODEL, role, source[1]),
+                    requirement_contract,
+                )
                 now = datetime.now(timezone.utc)
                 with psycopg.connect(DATABASE_URL) as connection:
+                    require_current_planning_approval(
+                        connection,
+                        approval_id,
+                        action,
+                        lock_state=True,
+                    )
                     row = connection.execute(
                         """
                         INSERT INTO agent_worker_plans
                             (agent_name, role, schema_version, engineering_plan_id, requested_by,
                              approval_request_id, status, plan, created_at, updated_at)
                         VALUES (%s, %s, '1.0', %s, %s, %s, 'draft', %s::jsonb, %s, %s)
+                        ON CONFLICT (approval_request_id) DO NOTHING
                         RETURNING id
                         """,
                         (agent_name, role, engineering_plan_id, requested_by, approval_id, json.dumps(plan), now, now),
                     ).fetchone()
-                    record_audit_event(connection, agent_name, "worker_plan_generated", agent_name, str(row[0]), {"approval_id": approval_id, "engineering_plan_id": engineering_plan_id, "role": role})
+                    if row is None:
+                        existing = connection.execute(
+                            "SELECT id, status, role FROM agent_worker_plans WHERE approval_request_id = %s",
+                            (approval_id,),
+                        ).fetchone()
+                        if existing is None:
+                            raise RuntimeError("worker plan insert returned no artifact")
+                        plan_id = int(existing[0])
+                        plan_status = existing[1]
+                        if existing[2] != role:
+                            raise RuntimeError("approval request belongs to another worker role")
+                        created = False
+                    else:
+                        plan_id = int(row[0])
+                        plan_status = "draft"
+                        created = True
+                        record_audit_event(
+                            connection,
+                            agent_name,
+                            "worker_plan_generated",
+                            agent_name,
+                            str(plan_id),
+                            {"approval_id": approval_id, "engineering_plan_id": engineering_plan_id, "role": role},
+                        )
                     connection.commit()
-                queue_automated_handoff(
-                    "approve_software_engineer_plan" if role == "software_engineer" else "approve_qa_plan",
-                    agent_name,
-                    {"worker_plan_id": row[0]},
+                if created:
+                    queue_automated_handoff(
+                        "approve_software_engineer_plan" if role == "software_engineer" else "approve_qa_plan",
+                        agent_name,
+                        {"worker_plan_id": plan_id},
+                    )
+                self._json_response(
+                    201 if created else 200,
+                    {"id": plan_id, "status": plan_status, "role": role, "schema_version": "1.0"},
                 )
-                self._json_response(201, {"id": row[0], "status": "draft", "role": role, "schema_version": "1.0"})
+            except GenerationBudgetExhaustedError as error:
+                logger.warning("worker plan generation exhausted its model budget")
+                self._json_response(
+                    503,
+                    {
+                        "error": "generation_budget_exhausted",
+                        "retryable": True,
+                        "detail": str(error)[:500],
+                    },
+                )
             except (KeyError, ValueError, TypeError, json.JSONDecodeError) as error:
                 self._json_response(400, {"error": str(error)})
+            except PlanningResetConflict as error:
+                self._json_response(409, {"error": str(error)})
             except Exception as error:
                 logger.exception("worker plan generation failed")
                 self._json_response(502, {"error": type(error).__name__})
@@ -2915,7 +5318,6 @@ class ReportHandler(BaseHTTPRequestHandler):
                 approval_id = int(payload["approval_id"])
                 brief_id = int(payload["product_brief_id"])
                 requested_by = str(payload.get("requested_by", "operator")).strip()
-                init_database()
                 with psycopg.connect(DATABASE_URL) as connection:
                     if not approved_action(connection, approval_id, "generate_technical_plan"):
                         self._json_response(403, {"error": "approved generate_technical_plan request required"})
@@ -2933,19 +5335,23 @@ class ReportHandler(BaseHTTPRequestHandler):
                             self._json_response(400, {"error": "technical-plan dependencies must be non-empty strings"})
                             return
                     brief_row = connection.execute(
-                        "SELECT status, brief, backlog FROM agent_product_briefs WHERE id = %s",
+                        "SELECT status, brief, backlog, requirements FROM agent_product_briefs WHERE id = %s",
                         (brief_id,),
                     ).fetchone()
                     if brief_row is None or brief_row[0] != "approved":
                         self._json_response(409, {"error": "an approved product brief is required"})
                         return
                     already_used = connection.execute(
-                        "SELECT 1 FROM agent_technical_plans WHERE approval_request_id = %s",
+                        "SELECT id, status FROM agent_technical_plans WHERE approval_request_id = %s",
                         (approval_id,),
                     ).fetchone()
                     if already_used:
-                        self._json_response(409, {"error": "approval request already generated a technical plan"})
+                        self._json_response(
+                            200,
+                            {"id": int(already_used[0]), "status": already_used[1], "schema_version": "1.0"},
+                        )
                         return
+                    requirement_contract = load_requirement_contract(connection, brief_id)
                     record_audit_event(
                         connection, CTO_NAME, "approved_action_started", requested_by,
                         str(approval_id), {"action": "generate_technical_plan", "product_brief_id": brief_id},
@@ -2958,11 +5364,19 @@ class ReportHandler(BaseHTTPRequestHandler):
                     {
                         "brief": brief_row[1],
                         "backlog": brief_row[2],
+                        "requirement_contract": requirement_contract,
                         "required_dependencies": dependencies,
                     },
                 )
+                plan = attach_requirement_contract(plan, requirement_contract)
                 now = datetime.now(timezone.utc)
                 with psycopg.connect(DATABASE_URL) as connection:
+                    require_current_planning_approval(
+                        connection,
+                        approval_id,
+                        "generate_technical_plan",
+                        lock_state=True,
+                    )
                     row = connection.execute(
                         """
                         INSERT INTO agent_technical_plans
@@ -2970,6 +5384,7 @@ class ReportHandler(BaseHTTPRequestHandler):
                              approval_request_id, parent_technical_plan_id, revision_type,
                              dependencies, status, plan, created_at, updated_at)
                         VALUES (%s, '1.0', %s, %s, %s, %s, %s, %s::jsonb, 'draft', %s::jsonb, %s, %s)
+                        ON CONFLICT (approval_request_id) DO NOTHING
                         RETURNING id
                         """,
                         (
@@ -2978,26 +5393,45 @@ class ReportHandler(BaseHTTPRequestHandler):
                             revision_type, json.dumps(dependencies), json.dumps(plan), now, now,
                         ),
                     ).fetchone()
-                    record_audit_event(
-                        connection, CTO_NAME, "technical_plan_generated", CTO_NAME,
-                        str(row[0]), {"approval_id": approval_id, "product_brief_id": brief_id},
-                    )
+                    if row is None:
+                        existing = connection.execute(
+                            "SELECT id, status FROM agent_technical_plans WHERE approval_request_id = %s",
+                            (approval_id,),
+                        ).fetchone()
+                        if existing is None:
+                            raise RuntimeError("technical plan insert returned no artifact")
+                        plan_id = int(existing[0])
+                        plan_status = existing[1]
+                        created = False
+                    else:
+                        plan_id = int(row[0])
+                        plan_status = "draft"
+                        created = True
+                        record_audit_event(
+                            connection, CTO_NAME, "technical_plan_generated", CTO_NAME,
+                            str(plan_id), {"approval_id": approval_id, "product_brief_id": brief_id},
+                        )
                     connection.commit()
-                if revision_type == "amendment":
+                if created and revision_type == "amendment":
                     create_pending_approval(
                         "approve_technical_plan",
                         CTO_NAME,
-                        f"Review technical-plan amendment {row[0]} and its explicit dependencies.",
-                        {"technical_plan_id": row[0], "parent_technical_plan_id": int(parent_plan_id), "revision_type": "amendment"},
+                        f"Review technical-plan amendment {plan_id} and its explicit dependencies.",
+                        {"technical_plan_id": plan_id, "parent_technical_plan_id": int(parent_plan_id), "revision_type": "amendment"},
                     )
-                else:
+                elif created:
                     queue_automated_handoff(
                         "approve_technical_plan", CTO_NAME,
-                        {"technical_plan_id": row[0]},
+                        {"technical_plan_id": plan_id},
                     )
-                self._json_response(201, {"id": row[0], "status": "draft", "schema_version": "1.0"})
+                self._json_response(
+                    201 if created else 200,
+                    {"id": plan_id, "status": plan_status, "schema_version": "1.0"},
+                )
             except (KeyError, ValueError, TypeError, json.JSONDecodeError) as error:
                 self._json_response(400, {"error": str(error)})
+            except PlanningResetConflict as error:
+                self._json_response(409, {"error": str(error)})
             except Exception as error:
                 logger.exception("technical plan generation failed")
                 self._json_response(502, {"error": type(error).__name__})
@@ -3054,21 +5488,11 @@ class ReportHandler(BaseHTTPRequestHandler):
                     "product_context": product_context,
                     "request_token": uuid.uuid4().hex,
                 }
-                queue_generation_approval(
+                request_id = queue_generation_approval(
                     "generate_product_brief",
                     PRODUCT_MANAGER_NAME,
                     context,
                 )
-                with psycopg.connect(DATABASE_URL) as connection:
-                    request_id = connection.execute(
-                        """
-                        SELECT id FROM agent_approval_requests
-                        WHERE action = 'generate_product_brief' AND status = 'approved'
-                          AND context = %s::jsonb
-                        ORDER BY id DESC LIMIT 1
-                        """,
-                        (json.dumps(context, sort_keys=True),),
-                    ).fetchone()[0]
                 self._json_response(
                     202,
                     {
@@ -3162,17 +5586,21 @@ class ReportHandler(BaseHTTPRequestHandler):
                 context = str(payload.get("product_context", PRODUCT_CONTEXT)).strip()
                 if not requested_by or not context or len(context) > 12_000:
                     raise ValueError("requested_by and product_context are required and context must be <= 12000 characters")
-                init_database()
                 with psycopg.connect(DATABASE_URL) as connection:
                     if not approved_action(connection, approval_id, "generate_product_brief"):
                         self._json_response(403, {"error": "approved generate_product_brief request required"})
                         return
+                    connection.execute("SELECT pg_advisory_xact_lock(%s)", (approval_id,))
                     already_used = connection.execute(
-                        "SELECT 1 FROM agent_product_briefs WHERE approval_request_id = %s",
+                        "SELECT id FROM agent_product_briefs WHERE approval_request_id = %s",
                         (approval_id,),
                     ).fetchone()
                     if already_used:
-                        self._json_response(409, {"error": "approval request already generated a product brief"})
+                        publication_approval_id = ensure_product_publication_approval(connection, int(already_used[0]))
+                        response = product_brief_generation_response(connection, int(already_used[0]))
+                        response["publication_approval_id"] = publication_approval_id
+                        connection.commit()
+                        self._json_response(200, response)
                         return
                     record_audit_event(
                         connection, PRODUCT_MANAGER_NAME, "approved_action_started",
@@ -3184,12 +5612,20 @@ class ReportHandler(BaseHTTPRequestHandler):
                 )
                 now = datetime.now(timezone.utc)
                 with psycopg.connect(DATABASE_URL) as connection:
+                    require_current_planning_approval(
+                        connection,
+                        approval_id,
+                        "generate_product_brief",
+                        lock_state=True,
+                    )
+                    connection.execute("SELECT pg_advisory_xact_lock(%s)", (approval_id,))
                     row = connection.execute(
                         """
                         INSERT INTO agent_product_briefs
                             (agent_name, schema_version, requested_by, approval_request_id,
-                             status, brief, backlog, source_context, created_at, updated_at)
-                        VALUES (%s, '1.0', %s, %s, 'draft', %s::jsonb, %s::jsonb, %s, %s, %s)
+                                status, brief, backlog, requirements, source_context, created_at, updated_at)
+                            VALUES (%s, '1.0', %s, %s, 'draft', %s::jsonb, %s::jsonb, '{}'::jsonb, %s, %s, %s)
+                        ON CONFLICT (approval_request_id) DO NOTHING
                         RETURNING id
                         """,
                         (
@@ -3198,28 +5634,32 @@ class ReportHandler(BaseHTTPRequestHandler):
                             context, now, now,
                         ),
                     ).fetchone()
-                    record_audit_event(
-                        connection, PRODUCT_MANAGER_NAME, "product_brief_generated",
-                        PRODUCT_MANAGER_NAME, str(row[0]), {"approval_id": approval_id},
-                    )
+                    if row is None:
+                        existing = connection.execute(
+                            "SELECT id FROM agent_product_briefs WHERE approval_request_id = %s",
+                            (approval_id,),
+                        ).fetchone()
+                        if existing is None:
+                            raise RuntimeError("product brief insert returned no artifact")
+                        brief_id = int(existing[0])
+                        created = False
+                    else:
+                        brief_id = int(row[0])
+                        created = True
+                        record_audit_event(
+                            connection, PRODUCT_MANAGER_NAME, "product_brief_generated",
+                            PRODUCT_MANAGER_NAME, str(brief_id), {"approval_id": approval_id},
+                        )
+                    load_requirement_contract(connection, brief_id)
+                    publication_approval_id = ensure_product_publication_approval(connection, brief_id)
+                    response = product_brief_generation_response(connection, brief_id)
+                    response["publication_approval_id"] = publication_approval_id
                     connection.commit()
-                publication_approval_id = create_pending_approval(
-                    "approve_product_brief",
-                    OPERATOR_NAME,
-                    f"Review and publish generated product brief {row[0]}.",
-                    {"product_brief_id": row[0]},
-                )
-                self._json_response(
-                    201,
-                    {
-                        "id": row[0],
-                        "status": "draft",
-                        "schema_version": "1.0",
-                        "publication_approval_id": publication_approval_id,
-                    },
-                )
+                self._json_response(201 if created else 200, response)
             except (KeyError, ValueError, TypeError, json.JSONDecodeError) as error:
                 self._json_response(400, {"error": str(error)})
+            except PlanningResetConflict as error:
+                self._json_response(409, {"error": str(error)})
             except Exception as error:
                 logger.exception("product brief generation failed")
                 self._json_response(502, {"error": type(error).__name__})
@@ -3267,7 +5707,6 @@ class ReportHandler(BaseHTTPRequestHandler):
             try:
                 payload = self._request_json()
                 approval_id = int(payload["approval_id"])
-                init_database()
                 with psycopg.connect(DATABASE_URL) as connection:
                     if not approved_action(connection, approval_id, "read_health_report"):
                         self._json_response(403, {"error": "approved read_health_report request required"})
@@ -3393,6 +5832,8 @@ def main() -> None:
     threading.Thread(target=work_item_orchestrator_loop, daemon=True).start()
     threading.Thread(target=repository_worker_loop, daemon=True).start()
     threading.Thread(target=proposal_qa_worker_loop, daemon=True).start()
+    threading.Thread(target=run_notification_worker, args=(DATABASE_URL,), daemon=True).start()
+    time.sleep(EXECUTION_WORKER_INTERVAL_SECONDS)
     while True:
         run_once()
         time.sleep(INTERVAL_SECONDS)

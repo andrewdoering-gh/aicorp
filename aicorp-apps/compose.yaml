@@ -84,7 +84,7 @@ services:
       LITELLM_MASTER_KEY: "${LITELLM_MASTER_KEY:?LITELLM_MASTER_KEY must be set in the external environment}"
       OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
       OLLAMA_BASE_URL: "${OLLAMA_BASE_URL:?OLLAMA_BASE_URL must be set in the external environment}"
-      DATABASE_URL: "${DATABASE_URL:?DATABASE_URL must be set in the external environment}"
+      DATABASE_URL: "${LITELLM_DATABASE_URL:?LITELLM_DATABASE_URL must be set in the external environment}"
 
     ports:
       - "127.0.0.1:4000:4000"
@@ -113,6 +113,13 @@ services:
     image: ghcr.io/open-webui/open-webui:v0.6.31
     container_name: aicorp-open-webui
     restart: unless-stopped
+
+    healthcheck:
+      test: ["CMD-SHELL", "curl --silent --fail --max-time 5 http://localhost:8080/health | jq -ne 'input.status == true'"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
 
     environment:
       OPENAI_API_BASE_URL: http://litellm:4000/v1
@@ -214,22 +221,25 @@ services:
   agent:
     build:
       context: /opt/aicorp/agent
-    image: aicorp-health-agent:0.2.0
+    image: aicorp-health-agent:0.3.0
     container_name: aicorp-agent
     restart: unless-stopped
 
     environment:
       AGENT_NAME: "${AGENT_NAME:-aicorp-health-summary}"
-      AGENT_MODEL: "${AGENT_MODEL:-gpt-5.6-luna}"
+      AGENT_MODEL: "${AGENT_MODEL:-local-qwen3.5-9b}"
       PRODUCT_MANAGER_NAME: "${PRODUCT_MANAGER_NAME:-aicorp-product-manager}"
-      PRODUCT_MANAGER_MODEL: "${PRODUCT_MANAGER_MODEL:-gpt-5.6-luna}"
+      PRODUCT_MANAGER_MODEL: "${PRODUCT_MANAGER_MODEL:-local-qwen3.5-9b}"
       CTO_NAME: "${CTO_NAME:-aicorp-cto}"
-      CTO_MODEL: "${CTO_MODEL:-gpt-5.6-luna}"
+      CTO_MODEL: "${CTO_MODEL:-local-qwen3.5-9b}"
       ENGINEERING_MANAGER_NAME: "${ENGINEERING_MANAGER_NAME:-aicorp-engineering-manager}"
-      ENGINEERING_MANAGER_MODEL: "${ENGINEERING_MANAGER_MODEL:-gpt-5.6-luna}"
+      ENGINEERING_MANAGER_MODEL: "${ENGINEERING_MANAGER_MODEL:-local-qwen3.5-9b}"
       SOFTWARE_ENGINEER_NAME: "${SOFTWARE_ENGINEER_NAME:-aicorp-software-engineer}"
       QA_ENGINEER_NAME: "${QA_ENGINEER_NAME:-aicorp-qa-engineer}"
-      WORKER_MODEL: "${WORKER_MODEL:-gpt-5.6-luna}"
+      WORKER_MODEL: "${WORKER_MODEL:-local-qwen3.5-9b}"
+      AICORP_REASONING_MAX_TOKENS: "${AICORP_REASONING_MAX_TOKENS:-65536}"
+      AICORP_PROPOSAL_MAX_TOKENS: "${AICORP_PROPOSAL_MAX_TOKENS:-8192}"
+      AICORP_MAX_DEPLOYMENT_ATTEMPTS: "${AICORP_MAX_DEPLOYMENT_ATTEMPTS:-3}"
       AGENT_INTERVAL_SECONDS: "${AGENT_INTERVAL_SECONDS:-3600}"
       AGENT_HTTP_PORT: "8081"
       AGENT_APPROVAL_TOKEN: "${AGENT_APPROVAL_TOKEN:-}"
@@ -239,6 +249,8 @@ services:
       ENGINEERING_MANAGER_APPROVAL_TOKEN: "${ENGINEERING_MANAGER_APPROVAL_TOKEN:-}"
       SOFTWARE_ENGINEER_APPROVAL_TOKEN: "${SOFTWARE_ENGINEER_APPROVAL_TOKEN:-}"
       QA_ENGINEER_APPROVAL_TOKEN: "${QA_ENGINEER_APPROVAL_TOKEN:-}"
+      AICORP_TEAMS_WEBHOOK_URL: "${AICORP_TEAMS_WEBHOOK_URL:-}"
+      AICORP_NOTIFICATION_POLL_SECONDS: "${AICORP_NOTIFICATION_POLL_SECONDS:-5}"
       DATABASE_URL: "${DATABASE_URL:?DATABASE_URL must be set in the external environment}"
       LITELLM_BASE_URL: "http://litellm:4000"
       LITELLM_MASTER_KEY: "${LITELLM_MASTER_KEY:?LITELLM_MASTER_KEY must be set in the external environment}"
@@ -247,6 +259,10 @@ services:
       KNOWLEDGE_COLLECTION: "${KNOWLEDGE_COLLECTION:-aicorp-knowledge}"
       PROMETHEUS_URL: "http://prometheus:9090"
       QDRANT_URL: "http://qdrant:6333"
+      AICORP_DEVICE_ID: "${AICORP_DEVICE_ID:-aicorp-control01}"
+      AICORP_DEVICE_NAME: "${AICORP_DEVICE_NAME:-AICorp Control Plane}"
+      AICORP_DEVICE_STALE_SECONDS: "${AICORP_DEVICE_STALE_SECONDS:-300}"
+      AICORP_PRODUCT_VERSION: "${AICORP_PRODUCT_VERSION:-0.3.0}"
 
     depends_on:
       postgres:

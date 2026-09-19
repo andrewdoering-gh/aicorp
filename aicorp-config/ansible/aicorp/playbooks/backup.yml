@@ -7,6 +7,8 @@
     aicorp_backup_mount: /mnt/backup
     aicorp_backup_root: /mnt/backup/aicorp
     aicorp_backup_retention: 7
+    aicorp_backup_service: /etc/systemd/system/aicorp-backup.service
+    aicorp_backup_timer: /etc/systemd/system/aicorp-backup.timer
 
   tasks:
     - name: Install AICorp backup script
@@ -16,3 +18,33 @@
         owner: root
         group: root
         mode: "0750"
+
+    - name: Install AICorp backup service
+      ansible.builtin.template:
+        src: ../templates/aicorp-backup.service.j2
+        dest: "{{ aicorp_backup_service }}"
+        owner: root
+        group: root
+        mode: "0644"
+      notify: Reload systemd
+
+    - name: Install AICorp backup timer
+      ansible.builtin.template:
+        src: ../templates/aicorp-backup.timer.j2
+        dest: "{{ aicorp_backup_timer }}"
+        owner: root
+        group: root
+        mode: "0644"
+      notify: Reload systemd
+
+    - name: Enable and start AICorp backup timer
+      ansible.builtin.systemd:
+        name: aicorp-backup.timer
+        enabled: true
+        state: started
+        daemon_reload: true
+
+  handlers:
+    - name: Reload systemd
+      ansible.builtin.systemd:
+        daemon_reload: true

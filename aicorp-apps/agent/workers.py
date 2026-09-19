@@ -1,9 +1,23 @@
 import json
+import logging
 import os
 import re
+import threading
+import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Any
+
+from requirements import validate_requirement_contract
+from workstreams import WORKSTREAM_IDS
+
+
+_GENERATION_LOCK = threading.Lock()
+GENERATION_TIMEOUT_SECONDS = max(90, int(os.environ.get("AICORP_GENERATION_TIMEOUT_SECONDS", "1800")))
+REASONING_MAX_TOKENS = max(16384, int(os.environ.get("AICORP_REASONING_MAX_TOKENS", "65536")))
+PROPOSAL_MAX_TOKENS = max(4096, int(os.environ.get("AICORP_PROPOSAL_MAX_TOKENS", "8192")))
+logger = logging.getLogger("aicorp-agent.workers")
 
 
 PLAN_FIELDS = {
@@ -14,6 +28,7 @@ PLAN_FIELDS = {
     "test_strategy",
     "risks_and_open_decisions",
     "recommendation",
+    "requirement_contract",
 }
 WORKSTREAM_FIELDS = {"id", "title", "description", "priority", "tasks", "acceptance_criteria"}
 MILESTONE_FIELDS = {"id", "title", "description", "status", "dependencies"}
@@ -26,8 +41,13 @@ WORKER_FIELDS = {
     "tests",
     "risks",
     "handoff",
+    "requirement_contract",
 }
 VALID_PRIORITIES = {"now", "next", "later"}
+
+
+class GenerationBudgetExhaustedError(ValueError):
+    pass
 
 
 def _repository_paths() -> set[str]:
@@ -62,8 +82,9 @@ def validate_engineering_plan(payload: Any) -> dict[str, Any]:
         raise ValueError("engineering plan fields do not match the required schema")
     normalized = {
         field: _strings(payload[field], field)
-        for field in PLAN_FIELDS - {"workstreams", "milestones", "recommendation"}
+        for field in PLAN_FIELDS - {"workstreams", "milestones", "recommendation", "requirement_contract"}
     }
+    normalized["requirement_contract"] = validate_requirement_contract(payload["requirement_contract"])
     milestones = payload["milestones"]
     if not isinstance(milestones, list) or not 1 <= len(milestones) <= 16:
         raise ValueError("milestones must contain between one and sixteen items")
@@ -93,14 +114,22 @@ def validate_engineering_plan(payload: Any) -> dict[str, Any]:
     if not isinstance(workstreams, list) or not 1 <= len(workstreams) <= 16:
         raise ValueError("workstreams must contain between one and sixteen items")
     normalized_workstreams = []
+    workstream_ids = set()
     for item in workstreams:
         if not isinstance(item, dict) or set(item) != WORKSTREAM_FIELDS:
             raise ValueError("workstream fields do not match the required schema")
+        workstream_id = str(item["id"]).strip()
+        if workstream_id not in WORKSTREAM_IDS:
+            allowed_ids = ", ".join(sorted(WORKSTREAM_IDS))
+            raise ValueError(f"workstream id must be one of: {allowed_ids}")
+        if workstream_id in workstream_ids:
+            raise ValueError(f"workstream id must be unique: {workstream_id}")
         if item["priority"] not in VALID_PRIORITIES:
             raise ValueError("workstream priority must be now, next, or later")
+        workstream_ids.add(workstream_id)
         normalized_workstreams.append(
             {
-                "id": str(item["id"]).strip(),
+                "id": workstream_id,
                 "title": str(item["title"]).strip(),
                 "description": str(item["description"]).strip(),
                 "priority": item["priority"],
@@ -137,8 +166,9 @@ def validate_worker_output(payload: Any, expected_role: str) -> dict[str, Any]:
                 and re.fullmatch(r"[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)+", path)
             ][:8]
     normalized = {"role": expected_role}
-    for field in WORKER_FIELDS - {"role"}:
+    for field in WORKER_FIELDS - {"role", "requirement_contract"}:
         normalized[field] = _strings(payload[field], field)
+    normalized["requirement_contract"] = validate_requirement_contract(payload["requirement_contract"])
     if expected_role == "software_engineer":
         paths = normalized["files_or_surfaces"]
         if not paths or any(
@@ -154,34 +184,156 @@ def validate_worker_output(payload: Any, expected_role: str) -> dict[str, Any]:
     return normalized
 
 
-def _generate(base_url: str, api_key: str, model: str, system: str, prompt: str) -> dict[str, Any]:
+def build_qa_worker_plan(engineering_plan: dict[str, Any]) -> dict[str, Any]:
+    workstreams = engineering_plan.get("workstreams", [])
+    if not isinstance(workstreams, list) or not workstreams:
+        raise ValueError("approved engineering plan must contain workstreams for QA planning")
+    workstream_ids = [
+        str(workstream.get("id", "")).strip()
+        for workstream in workstreams
+        if isinstance(workstream, dict) and str(workstream.get("id", "")).strip()
+    ]
+    if not workstream_ids:
+        raise ValueError("approved engineering plan workstreams must have IDs for QA planning")
+    acceptance_criteria = [
+        criterion.strip()
+        for workstream in workstreams
+        if isinstance(workstream, dict)
+        for criterion in workstream.get("acceptance_criteria", [])
+        if isinstance(criterion, str) and criterion.strip()
+    ]
+    test_strategy = engineering_plan.get("test_strategy", [])
+    if not isinstance(test_strategy, list):
+        test_strategy = []
+    risks = engineering_plan.get("risks_and_open_decisions", [])
+    if not isinstance(risks, list):
+        risks = []
+    payload = {
+        "role": "qa_engineer",
+        "scope": [
+            f"Validate execution evidence and acceptance criteria for {workstream_id}."
+            for workstream_id in workstream_ids
+        ],
+        "implementation_steps": [
+            "Review each approved workstream and its acceptance criteria.",
+            "Verify submitted evidence is factual, bounded, and tied to the current workflow lineage.",
+            "Record pass or fail evidence before any repository proposal or deployment gate advances.",
+        ],
+        "files_or_surfaces": [f"workstream:{workstream_id}" for workstream_id in workstream_ids],
+        "tests": (test_strategy or acceptance_criteria or [
+            "Verify every approved workstream has execution evidence and acceptance coverage."
+        ])[:16],
+        "risks": (risks or [
+            "Execution evidence may omit an acceptance criterion or reference an unrelated workflow artifact."
+        ])[:16],
+        "handoff": [
+            "Record factual checks and evidence for each submitted task.",
+            "Reject evidence that is incomplete, unverifiable, or from another engineering-plan lineage.",
+                "If deployment failure evidence is present below, treat it as the defect report: diagnose each failed acceptance criterion, "
+                "make the corrective change in the approved surface, and do not merely restate or re-test the previous implementation. "
+        ],
+        "requirement_contract": engineering_plan["requirement_contract"],
+    }
+    return validate_worker_output(payload, "qa_engineer")
+
+
+def _generate(
+    base_url: str,
+    api_key: str,
+    model: str,
+    system: str,
+    prompt: str,
+    max_tokens: int = 4096,
+    think: bool = False,
+) -> dict[str, Any]:
+    generation_options = {
+        "temperature": 0.2,
+        "max_tokens": max_tokens,
+        "think": think,
+        "reasoning_effort": "high" if think else "none",
+        "extra_body": {
+            "think": think,
+            "chat_template_kwargs": {"enable_thinking": think},
+        },
+    }
     request = urllib.request.Request(
         f"{base_url.rstrip('/')}/v1/chat/completions",
         data=json.dumps(
             {
                 "model": model,
                 "messages": [{"role": "system", "content": system}, {"role": "user", "content": prompt}],
-                **({} if model == "gpt-5.6-luna" else {"temperature": 0.2}),
+                **({} if model == "gpt-5.6-luna" else generation_options),
                 "response_format": {"type": "json_object"},
             }
         ).encode("utf-8"),
         headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
         method="POST",
     )
-    with urllib.request.urlopen(request, timeout=300) as response:
-        content = json.load(response)["choices"][0]["message"]["content"].strip()
+    content = ""
+    response_shape: dict[str, object] = {}
+    for attempt in range(3):
+        try:
+            with _GENERATION_LOCK:
+                with urllib.request.urlopen(request, timeout=GENERATION_TIMEOUT_SECONDS) as response:
+                    body = json.load(response)
+            choice = body.get("choices", [{}])[0] if isinstance(body, dict) else {}
+            message = choice.get("message", {}) if isinstance(choice, dict) else {}
+            content = message.get("content") or "" if isinstance(message, dict) else ""
+            content = content.strip() if isinstance(content, str) else ""
+            response_shape = {
+                "finish_reason": choice.get("finish_reason") if isinstance(choice, dict) else None,
+                "message_keys": sorted(message) if isinstance(message, dict) else [],
+                "content_length": len(content),
+                "reasoning_length": len(
+                    message.get("reasoning_content") or message.get("reasoning") or ""
+                ) if isinstance(message, dict) else 0,
+            }
+            if response_shape["finish_reason"] == "length":
+                logger.error("model exhausted its output budget; not retrying response_shape=%s", response_shape)
+                raise GenerationBudgetExhaustedError(
+                    f"model exhausted its output budget: {response_shape}"
+                )
+            if not content:
+                logger.warning(
+                    "model returned empty content; retrying attempt=%s response_shape=%s",
+                    attempt + 1,
+                    response_shape,
+                )
+                continue
+            break
+        except urllib.error.HTTPError as error:
+            if error.code != 429 or attempt == 2:
+                raise
+            retry_after = error.headers.get("Retry-After")
+            delay = min(30, max(2, int(retry_after))) if retry_after and retry_after.isdigit() else 5 * (attempt + 1)
+            time.sleep(delay)
     if "</think>" in content:
         content = content.rsplit("</think>", 1)[1].strip()
     if content.startswith("```"):
         content = content.split("\n", 1)[1].rsplit("```", 1)[0].strip()
+    if not content:
+        raise ValueError(f"model returned an empty response: {response_shape}")
     try:
         return json.loads(content)
-    except json.JSONDecodeError:
+    except json.JSONDecodeError as error:
         start = content.find("{")
         if start < 0:
-            raise
-        payload, _ = json.JSONDecoder().raw_decode(content[start:])
-        return payload
+            logger.warning(
+                "model returned non-JSON output: length=%s preview=%r",
+                len(content),
+                content[:300],
+            )
+            raise ValueError("model response did not contain a JSON object") from error
+        try:
+            payload, _ = json.JSONDecoder().raw_decode(content[start:])
+            return payload
+        except json.JSONDecodeError as decode_error:
+            logger.warning(
+                "model returned malformed JSON: length=%s preview=%r",
+                len(content),
+                content[:300],
+            )
+            raise ValueError("model response contained malformed JSON") from decode_error
 
 
 def generate_engineering_plan(base_url: str, api_key: str, model: str, technical_plan: dict[str, Any]) -> dict[str, Any]:
@@ -191,6 +343,9 @@ def generate_engineering_plan(base_url: str, api_key: str, model: str, technical
         "deploy infrastructure, or invent missing requirements. Milestones must be structured objects with an id, "
         "title, description, status, and dependencies. Use status 'planned' for new work. Do not use 'complete' "
         "or claim that work is finished unless the approved execution records and QA evidence explicitly prove it. "
+        "Workstream IDs must be unique and use only the exact canonical IDs WS-01, WS-02, and WS-03; do not invent "
+        "descriptive IDs such as ws-dashboard, ws-agent, or ws-alerting. "
+        "Copy the requirement_contract from the approved CTO plan exactly; do not omit, summarize, or alter it. "
         "Return JSON only.\n\n"
         f"Approved CTO plan:\n{json.dumps(technical_plan, indent=2, default=str)}\n\n"
         'Schema: {"workstreams":[{"id":"string","title":"string","description":"string",'
@@ -198,11 +353,38 @@ def generate_engineering_plan(base_url: str, api_key: str, model: str, technical
         '"milestones":[{"id":"string","title":"string","description":"string",'
         '"status":"planned|in_progress|blocked|complete","dependencies":["string"]}],'
         '"dependencies":["string"],"definition_of_done":["string"],'
-        '"test_strategy":["string"],"risks_and_open_decisions":["string"],"recommendation":"string"}'
+        '"test_strategy":["string"],"risks_and_open_decisions":["string"],"recommendation":"string",'
+        '"requirement_contract":{}}'
     )
-    return validate_engineering_plan(
-        _generate(base_url, api_key, model, "You are a careful Engineering Manager. Output valid JSON only.", prompt)
+    system = "You are a careful Engineering Manager. Think through the plan internally, then output valid JSON only."
+    payload = _generate(
+        base_url,
+        api_key,
+        model,
+        system,
+        prompt,
+        max_tokens=REASONING_MAX_TOKENS,
+        think=True,
     )
+    try:
+        return validate_engineering_plan(payload)
+    except ValueError as error:
+        correction_prompt = (
+            prompt
+            + f"\n\nYour previous response failed validation: {error}. Regenerate the complete JSON response. "
+            "Use only the exact unique workstream IDs WS-01, WS-02, and WS-03."
+        )
+        return validate_engineering_plan(
+            _generate(
+                base_url,
+                api_key,
+                model,
+                system,
+                correction_prompt,
+                max_tokens=REASONING_MAX_TOKENS,
+                think=True,
+            )
+        )
 
 
 def generate_worker_plan(
@@ -212,6 +394,9 @@ def generate_worker_plan(
     role: str,
     engineering_plan: dict[str, Any],
 ) -> dict[str, Any]:
+    if role == "qa_engineer":
+        logger.info("building deterministic QA worker plan from approved engineering plan")
+        return build_qa_worker_plan(engineering_plan)
     available_paths = sorted(_repository_paths())
     prompt = (
         f"Act as the AICorp {role.replace('_', ' ').title()} worker. The role field must be exactly "
@@ -221,14 +406,16 @@ def generate_worker_plan(
         "with aicorp/ (for example aicorp/agent/agent.py), never descriptions, directories, wildcards, or container paths. "
         "Choose only the specific files needed for this plan, at most 8 paths. Do not copy the available-file list "
         "into the response and do not return more than 8 files_or_surfaces entries. "
+        "Copy the requirement_contract from the approved Engineering Manager plan exactly; do not omit, summarize, or alter it. "
         "Return JSON only.\n\n"
         f"Available repository files (use only these for software_engineer files_or_surfaces): {available_paths}\n\n"
         f"Approved engineering plan:\n{json.dumps(engineering_plan, indent=2, default=str)}\n\n"
         'Schema: {"role":"string","scope":["string"],"implementation_steps":["string"],'
-        '"files_or_surfaces":["string"],"tests":["string"],"risks":["string"],"handoff":["string"]}'
+        '"files_or_surfaces":["string"],"tests":["string"],"risks":["string"],"handoff":["string"],'
+        '"requirement_contract":{}}'
     )
     system = f"You are a careful {role} worker. Output valid JSON only."
-    payload = _generate(base_url, api_key, model, system, prompt)
+    payload = _generate(base_url, api_key, model, system, prompt, think=False)
     try:
         return validate_worker_output(payload, role)
     except ValueError as error:
@@ -240,4 +427,7 @@ def generate_worker_plan(
             "Regenerate the complete JSON response now. Select no more than 8 individual files from the "
             "available repository files; do not include directories, prose, or the inventory itself."
         )
-        return validate_worker_output(_generate(base_url, api_key, model, system, correction_prompt), role)
+        return validate_worker_output(
+            _generate(base_url, api_key, model, system, correction_prompt, think=False),
+            role,
+        )

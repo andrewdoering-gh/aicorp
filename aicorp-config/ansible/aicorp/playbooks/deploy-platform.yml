@@ -1,4 +1,6 @@
 ---
+- import_playbook: backup.yml
+
 - name: Deploy AICorp platform services
   hosts: aicorp-control01
   become: true
@@ -39,6 +41,11 @@
         - "{{ aicorp_apps_source_dir }}/agent/cto.py"
         - "{{ aicorp_apps_source_dir }}/agent/workers.py"
         - "{{ aicorp_apps_source_dir }}/agent/execution.py"
+        - "{{ aicorp_apps_source_dir }}/agent/requirements.py"
+        - "{{ aicorp_apps_source_dir }}/agent/product.py"
+        - "{{ aicorp_apps_source_dir }}/agent/acceptance.py"
+        - "{{ aicorp_apps_source_dir }}/agent/notifications.py"
+        - "{{ aicorp_apps_source_dir }}/agent/workstreams.py"
         - "{{ aicorp_apps_source_dir }}/deployment-worker.py"
         - "{{ aicorp_umbrella_source_dir }}/README.md"
         - "{{ aicorp_umbrella_source_dir }}/docs/PROJECT.md"
@@ -186,7 +193,7 @@
         group: root
         mode: "0644"
 
-    - name: Copy the HomeLabOps product prototype to control01
+    - name: Copy the HomeLabOps product interface to control01
       ansible.builtin.copy:
         src: "{{ aicorp_apps_source_dir }}/agent/homelabops.html"
         dest: "{{ aicorp_agent_dir }}/homelabops.html"
@@ -222,6 +229,46 @@
       ansible.builtin.copy:
         src: "{{ aicorp_apps_source_dir }}/agent/execution.py"
         dest: "{{ aicorp_agent_dir }}/execution.py"
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Copy Product Brief requirement contract source to control01
+      ansible.builtin.copy:
+        src: "{{ aicorp_apps_source_dir }}/agent/requirements.py"
+        dest: "{{ aicorp_agent_dir }}/requirements.py"
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Copy HomeLabOps product state source to control01
+      ansible.builtin.copy:
+        src: "{{ aicorp_apps_source_dir }}/agent/product.py"
+        dest: "{{ aicorp_agent_dir }}/product.py"
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Copy product acceptance source to control01
+      ansible.builtin.copy:
+        src: "{{ aicorp_apps_source_dir }}/agent/acceptance.py"
+        dest: "{{ aicorp_agent_dir }}/acceptance.py"
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Copy notification worker source to control01
+      ansible.builtin.copy:
+        src: "{{ aicorp_apps_source_dir }}/agent/notifications.py"
+        dest: "{{ aicorp_agent_dir }}/notifications.py"
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Copy workstream definitions to control01
+      ansible.builtin.copy:
+        src: "{{ aicorp_apps_source_dir }}/agent/workstreams.py"
+        dest: "{{ aicorp_agent_dir }}/workstreams.py"
         owner: root
         group: root
         mode: "0644"

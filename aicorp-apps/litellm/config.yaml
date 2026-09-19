@@ -11,10 +11,8 @@ model_list:
 
   - model_name: local-qwen3.5-9b
     litellm_params:
-      model: ollama/qwen3.5:9b
+      model: ollama_chat/qwen3.5:9b
       api_base: os.environ/OLLAMA_BASE_URL
-      extra_body:
-        think: false
 
 litellm_settings:
   drop_params: true

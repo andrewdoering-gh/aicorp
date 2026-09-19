@@ -208,7 +208,8 @@ def acceptance_checks(contract: dict[str, Any]) -> list[dict[str, str]]:
 
 
 def acceptance_evidence_passed(evidence: Any, contract: dict[str, Any]) -> bool:
-    checks = acceptance_checks(contract)
+    normalized = validate_requirement_contract(contract)
+    checks = acceptance_checks(normalized)
     if not isinstance(evidence, list) or len(evidence) != len(checks):
         return False
     expected = {check["acceptance_criterion_id"] for check in checks}
@@ -217,7 +218,7 @@ def acceptance_evidence_passed(evidence: Any, contract: dict[str, Any]) -> bool:
         for item in evidence
         if isinstance(item, dict) and item.get("result") == "passed"
     }
-    return observed == expected and all(
+    evidence_complete = observed == expected and all(
         isinstance(item, dict)
         and isinstance(item.get("command"), str)
         and item["command"].strip()
@@ -232,6 +233,12 @@ def acceptance_evidence_passed(evidence: Any, contract: dict[str, Any]) -> bool:
         and item["runtime"].get("version")
         and item["runtime"].get("source_hash")
         for item in evidence
+    )
+    if not evidence_complete:
+        return False
+    updated = apply_acceptance_evidence(normalized, evidence)
+    return all(item["status"] == "done" for item in updated["items"]) and all(
+        goal["status"] == "achieved" for goal in updated["goals"]
     )
 
 

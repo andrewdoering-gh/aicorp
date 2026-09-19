@@ -92,7 +92,7 @@ class RegressionTests(unittest.TestCase):
                 contract,
             )
 
-    def test_unmapped_product_goal_cannot_be_marked_achieved(self):
+    def test_unmapped_product_goal_blocks_acceptance(self):
         contract = build_requirement_contract(
             17,
             {"goals": ["Visibility", "Maintenance automation"]},
@@ -119,7 +119,7 @@ class RegressionTests(unittest.TestCase):
             "runtime": {"service": "aicorp-agent", "version": "0.3.0", "source_hash": "abc"},
         }]
         updated = apply_acceptance_evidence(contract, evidence)
-        self.assertTrue(acceptance_evidence_passed(evidence, contract))
+        self.assertFalse(acceptance_evidence_passed(evidence, contract))
         self.assertEqual(updated["goals"][0]["status"], "achieved")
         self.assertEqual(updated["goals"][1]["status"], "blocked")
 
